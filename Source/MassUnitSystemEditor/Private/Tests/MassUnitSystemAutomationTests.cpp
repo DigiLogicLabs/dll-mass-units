@@ -19,6 +19,7 @@
 #include "Entity/MassUnitSpawner.h"
 #include "Entity/UnitTemplate.h"
 #include "Gameplay/MassUnitCrowdSystem.h"
+#include "Visual/CrowdInstanceRenderer.h"
 #include "Kismet/GameplayStatics.h"
 #include "MassEntityManager.h"
 #include "MassEntitySubsystem.h"
@@ -507,8 +508,14 @@ bool FMassUnitNativeLifecycleTest::RunTest(const FString& Parameters)
 		return false;
 	}
 	VisualSystem->UpdateUnitVisualsByHandles(SpawnedUnits);
+	// Asserted against the published contract, NOT a literal. This previously hardcoded 8 and went red
+	// the moment the layout was extended to 10 (RandomSeed + Speed) - a stale magic number in a suite
+	// nobody had run. Referencing CrowdCustomData::NumFloats means an append-only extension keeps this
+	// green automatically, while a RENUMBERING - the thing the contract actually forbids - still breaks
+	// the channel-index assertions below.
 	TestEqual(TEXT("Instanced fallback exposes the documented animation/LOD/team/health custom-data layout"),
-		VisualSystem->GetInstancedMeshCustomDataFloatCount(), 8);
+		VisualSystem->GetInstancedMeshCustomDataFloatCount(),
+		UE::MassUnitSystem::CrowdCustomData::NumFloats);
 	TestTrue(TEXT("Quick-start units have either configured Niagara or asset-free instanced rendering"),
 		VisualSystem->IsUsingNiagara() || VisualSystem->GetInstancedMeshInstanceCount() == SpawnedUnits.Num());
 

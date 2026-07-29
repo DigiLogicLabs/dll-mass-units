@@ -246,6 +246,38 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitPlayerEngagementConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && GameplayEffectToTarget", ClampMin = "0.0"))
 	float GameplayEffectLevel = 1.0f;
 
+	/**
+	 * Maximum units allowed to be mid-attack at the same time. Zero is unlimited.
+	 *
+	 * A unit must take a token from the group's pool to commit an attack and holds it for one attack
+	 * cooldown, so peak incoming damage is bounded by MaxSimultaneousAttackers / AttackCooldown rather
+	 * than by however many units happened to path into range. Units that cannot get a token wait on the
+	 * standoff ring instead of piling into the target.
+	 *
+	 * Leave at zero to keep the pre-token behaviour. Six to ten reads as an aggressive swarm while
+	 * keeping incoming damage designed rather than emergent.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks", ClampMin = "0", UIMin = "0", UIMax = "24"))
+	int32 MaxSimultaneousAttackers = 0;
+
+	/** Where token-less units wait, as a multiple of attack range. Must exceed one or they attack anyway. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && MaxSimultaneousAttackers > 0", ClampMin = "1.05", ClampMax = "4.0"))
+	float StandoffDistanceMultiplier = 1.35f;
+
+	/**
+	 * Spread engaged units around the target on fixed angular slots instead of random follow offsets.
+	 *
+	 * Without this, every engaged unit steers at the same point and compacts into a solid ring, which
+	 * reads as units clipping through each other rather than as a coordinated attack. Slots are derived
+	 * deterministically from the entity index, so they cost no bookkeeping and survive respawns.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Following")
+	bool bUseEngagementSlots = false;
+
+	/** Number of angular positions around the target. Units sharing a slot are separated by the usual steering. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Following", meta = (EditCondition = "bUseEngagementSlots", ClampMin = "3", ClampMax = "64"))
+	int32 EngagementSlotCount = 12;
+
 	/** Resume ambient wandering after the target is released. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Lifecycle")
 	bool bReturnToWanderOnDeactivate = true;
@@ -299,6 +331,14 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdStats
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
 	int32 AttacksRequested = 0;
+
+	/** Units currently holding an attack token. Bounded by MaxSimultaneousAttackers when that is non-zero. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
+	int32 ActiveAttackers = 0;
+
+	/** Units in attack range but waiting on the standoff ring because the token pool was full. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
+	int32 UnitsAwaitingAttackToken = 0;
 
 	/** Group-level navmesh corridor queries issued by the most recent update. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
@@ -487,6 +527,14 @@ private:
 		bool bSharedPathUsesNavmesh = false;
 		float NextTargetRefreshTime = 0.0f;
 		float NextSharedPathUpdateTime = 0.0f;
+
+		/**
+		 * Units currently holding an attack token, mapped to the world time their token frees.
+		 *
+		 * Expiry-based rather than explicitly released, so a unit that dies, despawns, or leaves range
+		 * mid-attack cannot leak a token and starve the pool. Pruned lazily on acquisition.
+		 */
+		TMap<FMassUnitEntityHandle, float> AttackTokenExpiry;
 	};
 
 	struct FSpatialEntry
@@ -521,6 +569,16 @@ private:
 	bool bUpdatingCrowds = false;
 	TArray<float> SimulationLODDistances;
 	TArray<float> SimulationLODIntervalMultipliers;
+
+	/**
+	 * Takes an attack token for the entity if the pool has room, or renews one it already holds.
+	 * Returns false when the pool is full, which is the caller's signal to hold at standoff instead.
+	 * A zero MaxSimultaneousAttackers always succeeds and skips the bookkeeping entirely.
+	 */
+	bool TryAcquireAttackToken(FCrowdGroup& Group, FMassUnitEntityHandle Entity, float CurrentTime, float HoldDuration);
+
+	/** Drops expired tokens. Cheap enough to run per acquisition because the map is bounded by the pool size. */
+	void PruneAttackTokens(FCrowdGroup& Group, float CurrentTime);
 
 	void StartTimerIfNeeded();
 	void StopTimerIfIdle();

@@ -336,6 +336,9 @@ bool UMassUnitCrowdSystem::ConfigureCrowdGroupEngagement(
 	Group->bSharedPathUsesNavmesh = false;
 	Group->SharedPathTargetLocation = FVector::ZeroVector;
 	Group->NextSharedPathUpdateTime = 0.0f;
+	// Drop attack tokens with the engagement. Leaving them would make a re-engage start with a pool
+	// still occupied by units that are no longer attacking anything, throttling the first wave.
+	Group->AttackTokenExpiry.Reset();
 	if (!bEnableEngagement && Group->bEngaged)
 	{
 		return DeactivateCrowdGroupEngagement(CrowdGroupHandle, true);
@@ -712,12 +715,18 @@ void UMassUnitCrowdSystem::RefreshPopulationStats(const TArray<FSpatialEntry>& E
 	LastStats.SleepingUnits = 0;
 	LastStats.EngagedGroups = 0;
 	LastStats.EngagedUnits = 0;
+	LastStats.ActiveAttackers = 0;
+	LastStats.UnitsAwaitingAttackToken = 0;
 	for (const TPair<int32, FCrowdGroup>& Pair : Groups)
 	{
 		LastStats.ManagedSubgroups += Pair.Value.SubgroupCount;
 		if (Pair.Value.bEngaged && Pair.Value.TargetActor.IsValid())
 		{
 			++LastStats.EngagedGroups;
+			// Held tokens are the authoritative attacker count. Reading it here rather than counting
+			// units in the Attacking state keeps the number correct even between crowd updates, when a
+			// unit may still be posed mid-swing without having been revisited.
+			LastStats.ActiveAttackers += Pair.Value.AttackTokenExpiry.Num();
 		}
 	}
 	if (!EntitySubsystem)
@@ -737,6 +746,22 @@ void UMassUnitCrowdSystem::RefreshPopulationStats(const TArray<FSpatialEntry>& E
 		if (Group && Group->bEngaged && Group->TargetActor.IsValid())
 		{
 			++LastStats.EngagedUnits;
+			if (Group->EngagementConfig.MaxSimultaneousAttackers > 0
+				&& Group->EngagementConfig.bEnableAttacks
+				&& !Group->AttackTokenExpiry.Contains(Entry.Entity))
+			{
+				const FMassUnitStateFragment* AttackState =
+					EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Entry.Entity.ToMassEntityHandle());
+				const float AttackRange = Group->EngagementConfig.AttackRangeOverride > 0.0f
+					? Group->EngagementConfig.AttackRangeOverride
+					: (AttackState ? AttackState->AttackRange : 0.0f);
+				const float StandoffRange = AttackRange * Group->EngagementConfig.StandoffDistanceMultiplier;
+				if (AttackRange > 0.0f
+					&& FVector::DistSquared2D(Entry.Location, Group->LastTargetLocation) <= FMath::Square(StandoffRange))
+				{
+					++LastStats.UnitsAwaitingAttackToken;
+				}
+			}
 		}
 		const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entry.Entity.ToMassEntityHandle());
 		if (Crowd && Crowd->bSleeping)
@@ -1494,6 +1519,17 @@ void UMassUnitCrowdSystem::RemoveUnitFromPreviousGroup(FMassUnitEntityHandle Ent
 
 void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 {
+	// Expire tokens once per update for every group. Acquisition also prunes, but that only happens
+	// while somebody is in range; without this pass a group whose units all withdrew would keep
+	// reporting its last holders through ActiveAttackers forever.
+	for (TPair<int32, FCrowdGroup>& Pair : Groups)
+	{
+		if (!Pair.Value.AttackTokenExpiry.IsEmpty())
+		{
+			PruneAttackTokens(Pair.Value, CurrentTime);
+		}
+	}
+
 	TArray<int32> GroupHandles;
 	Groups.GetKeys(GroupHandles);
 	for (const int32 GroupHandle : GroupHandles)
@@ -1610,9 +1646,41 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 	const float AttackRange = Group.EngagementConfig.AttackRangeOverride > 0.0f
 		? Group.EngagementConfig.AttackRangeOverride
 		: State->AttackRange;
-	if (Group.EngagementConfig.bEnableAttacks
+	const bool bInAttackRange = Group.EngagementConfig.bEnableAttacks
 		&& AttackRange > 0.0f
-		&& DistanceSquared <= FMath::Square(AttackRange))
+		&& DistanceSquared <= FMath::Square(AttackRange);
+
+	// A unit already mid-cooldown keeps its token so it is not displaced by a newcomer between swings.
+	//
+	// The hold must outlast the time until this unit is next visited, not just its attack cooldown.
+	// Engaged units are processed round-robin under MaxUnitsPerUpdate, so a large group revisits any
+	// given unit only every ceil(GroupSize / Budget) updates. If the token expired in that gap, a
+	// holder that is still mid-attack would silently release it and a second unit would attack in its
+	// place, leaking the cap exactly when the crowd is largest. Over-holding only ever yields fewer
+	// simultaneous attackers, so erring long is the safe direction.
+	const int32 UpdatesPerCycle = MaxUnitsPerUpdate > 0
+		? FMath::CeilToInt(static_cast<float>(Group.Units.Num()) / static_cast<float>(MaxUnitsPerUpdate))
+		: 1;
+	const float TokenHoldDuration = FMath::Max(
+		State->AttackCooldown,
+		UpdateInterval * static_cast<float>(FMath::Max(1, UpdatesPerCycle)));
+	const bool bHasAttackToken = bInAttackRange
+		&& TryAcquireAttackToken(Group, Entry.Entity, CurrentTime, TokenHoldDuration);
+
+	// Attack-state debug. This is the tool for confirming token behaviour with placeholder meshes,
+	// before any attack animation exists: red means swinging, yellow means in range but waiting for a
+	// token. A solid red ring means MaxSimultaneousAttackers is unset or too high.
+	if (bInAttackRange && Group.EngagementConfig.bEnableVisualDebug && World)
+	{
+		const FColor StateColor = bHasAttackToken ? FColor::Red : FColor::Yellow;
+		DrawDebugSphere(World, Entry.Location + FVector(0.0f, 0.0f, 90.0f), 22.0f, 8, StateColor, false, UpdateInterval * 1.5f, 0, 1.5f);
+		if (bHasAttackToken)
+		{
+			DrawDebugLine(World, Entry.Location, TargetLocation, FColor::Red, false, UpdateInterval * 1.5f, 0, 2.0f);
+		}
+	}
+
+	if (bHasAttackToken)
 	{
 		ClearMovement(Entry.Entity, false);
 		Crowd->SteeringDirection = FVector::ZeroVector;
@@ -1648,8 +1716,34 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 	FVector FollowOffset = CalculateFollowOffset(Entry.Entity, Group);
 	if (Group.EngagementConfig.bEnableAttacks && AttackRange > 0.0f)
 	{
-		const float MaximumApproachRadius = AttackRange * 0.75f;
-		FollowOffset = FollowOffset.GetClampedToMaxSize(MaximumApproachRadius);
+		// Units that wanted to attack but found the token pool full wait on a ring outside attack
+		// range instead of pressing in. Without this they crowd the target and shove each other while
+		// permanently unable to swing, which reads far worse than simply waiting a turn.
+		const bool bWaitingForToken = bInAttackRange && !bHasAttackToken;
+		const float MaximumApproachRadius = bWaitingForToken
+			? AttackRange * FMath::Max(1.05f, Group.EngagementConfig.StandoffDistanceMultiplier)
+			: AttackRange * 0.75f;
+		if (bWaitingForToken)
+		{
+			// Push the unit out to the standoff ring rather than clamping, so it actually backs off.
+			// A group configured with zero follow distance and spread yields a zero-length offset, which
+			// would put the standoff point on top of the target and oscillate the unit in and out of
+			// range forever; fall back to the direction it is already standing in.
+			FVector StandoffDirection = FollowOffset.GetSafeNormal2D();
+			if (StandoffDirection.IsNearlyZero())
+			{
+				StandoffDirection = (Entry.Location - TargetLocation).GetSafeNormal2D();
+			}
+			if (StandoffDirection.IsNearlyZero())
+			{
+				StandoffDirection = FVector::ForwardVector;
+			}
+			FollowOffset = StandoffDirection * MaximumApproachRadius;
+		}
+		else
+		{
+			FollowOffset = FollowOffset.GetClampedToMaxSize(MaximumApproachRadius);
+		}
 	}
 	const bool bUseSharedPath = Group.bUseNavigation
 		&& !bUse3DMovement
@@ -1896,6 +1990,55 @@ FVector UMassUnitCrowdSystem::CalculateGroupAnchor(const FCrowdGroup& Group) con
 	return LivingUnitCount > 0 ? Anchor / static_cast<float>(LivingUnitCount) : Group.Center;
 }
 
+void UMassUnitCrowdSystem::PruneAttackTokens(FCrowdGroup& Group, float CurrentTime)
+{
+	for (auto It = Group.AttackTokenExpiry.CreateIterator(); It; ++It)
+	{
+		if (It->Value <= CurrentTime || !IsEntityValid(It->Key))
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+bool UMassUnitCrowdSystem::TryAcquireAttackToken(
+	FCrowdGroup& Group,
+	FMassUnitEntityHandle Entity,
+	float CurrentTime,
+	float HoldDuration)
+{
+	const int32 MaxAttackers = Group.EngagementConfig.MaxSimultaneousAttackers;
+	if (MaxAttackers <= 0)
+	{
+		// Unlimited: skip the bookkeeping entirely so the pre-token behaviour costs nothing.
+		return true;
+	}
+
+	// NO prune here on purpose. UpdateGroupEngagements prunes EVERY group once per update before any
+	// unit is processed, and this is that pass's only downstream caller, so pruning again per
+	// acquisition is pure redundancy - and expensive redundancy: it made expiry O(InRangeUnits *
+	// MaxAttackers) per update instead of O(MaxAttackers), with an IsEntityValid() entity lookup per
+	// visited entry. At 25 in-range units and a cap of 20 that is ~500 entry visits per update where
+	// 20 suffice, scaling with exactly the two numbers crowd performance is most sensitive to.
+	// If this ever gains a caller outside UpdateGroupEngagements, that caller must prune first.
+
+	// Hold for at least one crowd update, otherwise a cooldown shorter than the update interval
+	// would free the token before the holder is ever revisited and the cap would not bind.
+	const float Expiry = CurrentTime + FMath::Max(UpdateInterval, HoldDuration);
+
+	if (float* Existing = Group.AttackTokenExpiry.Find(Entity))
+	{
+		*Existing = Expiry;
+		return true;
+	}
+	if (Group.AttackTokenExpiry.Num() >= MaxAttackers)
+	{
+		return false;
+	}
+	Group.AttackTokenExpiry.Add(Entity, Expiry);
+	return true;
+}
+
 void UMassUnitCrowdSystem::RequestActorAttack(
 	FMassUnitEntityHandle Entity,
 	FCrowdGroup& Group,
@@ -2039,6 +2182,20 @@ FVector UMassUnitCrowdSystem::CalculateFollowOffset(
 	{
 		return RandomStream.VRand() * Radius;
 	}
+	// Engagement slots: while engaged, spread units over fixed angular positions around the target
+	// rather than random offsets, so the group forms a ring instead of compacting into one point.
+	// The slot is derived from the entity index, so it needs no per-unit bookkeeping and survives
+	// respawns. Units that collide on a slot are pushed apart by the usual separation steering.
+	if (Group.bEngaged
+		&& Group.EngagementConfig.bUseEngagementSlots
+		&& Group.Config.MovementMode != EMassUnitCrowdMovementMode::Free3D)
+	{
+		const int32 SlotCount = FMath::Max(3, Group.EngagementConfig.EngagementSlotCount);
+		const int32 SlotIndex = static_cast<int32>(Entity.ToMassEntityHandle().Index % SlotCount);
+		const float SlotAngle = (2.0f * UE_PI * static_cast<float>(SlotIndex)) / static_cast<float>(SlotCount);
+		return FVector(FMath::Cos(SlotAngle) * Radius, FMath::Sin(SlotAngle) * Radius, 0.0f);
+	}
+
 	int32 SubgroupIndex = 0;
 	if (EntitySubsystem)
 	{
@@ -2185,6 +2342,10 @@ FMassUnitPlayerEngagementConfig UMassUnitCrowdSystem::SanitizeEngagementConfig(
 	Result.AttackRangeOverride = FMath::Max(0.0f, Result.AttackRangeOverride);
 	Result.DamageMultiplier = FMath::Max(0.0f, Result.DamageMultiplier);
 	Result.GameplayEffectLevel = FMath::Max(0.0f, Result.GameplayEffectLevel);
+	Result.MaxSimultaneousAttackers = FMath::Max(0, Result.MaxSimultaneousAttackers);
+	// Below 1.0 the standoff ring would sit inside attack range, so token-less units would attack anyway.
+	Result.StandoffDistanceMultiplier = FMath::Clamp(Result.StandoffDistanceMultiplier, 1.05f, 4.0f);
+	Result.EngagementSlotCount = FMath::Clamp(Result.EngagementSlotCount, 3, 64);
 	return Result;
 }
 

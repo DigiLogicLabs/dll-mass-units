@@ -6,6 +6,7 @@
 #include "Entity/MassUnitEntityManager.h"
 #include "NiagaraUnitSystem.generated.h"
 
+class UCrowdInstanceRenderer;
 class UInstancedStaticMeshComponent;
 class UMassEntitySubsystem;
 class UNiagaraComponent;
@@ -38,21 +39,32 @@ public:
 
 	/** Number of dynamic ISM components currently allocated by the asset-free/static-mesh fallback. */
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
-	int32 GetInstancedMeshComponentCount() const { return InstancedMeshComponents.Num(); }
+	int32 GetInstancedMeshComponentCount() const;
 
-	/** Total instances currently submitted through the ISM fallback. Returns zero when Niagara is active. */
+	/** Units currently drawn through the ISM fallback. Returns zero when Niagara is active. */
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
 	int32 GetInstancedMeshInstanceCount() const;
 
+	/**
+	 * Instance slots allocated on the ISM components, including slots parked for reuse.
+	 * The gap between this and GetInstancedMeshInstanceCount is the recycling headroom kept for
+	 * respawns; it is reclaimed once parked slots dominate a bucket.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
+	int32 GetInstancedMeshAllocatedSlotCount() const;
+
 	/** Increments only when instanced-rendering slots are added or removed, not while units move. */
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
-	int32 GetInstancedMeshTopologyRevision() const { return InstancedMeshTopologyRevision; }
+	int32 GetInstancedMeshTopologyRevision() const;
 
-	/** Per-instance material data: animation index/time, LOD, team id/RGB, and health percent. */
+	/** Per-instance material data: see the channel contract in CrowdInstanceRenderer.h. */
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
-	int32 GetInstancedMeshCustomDataFloatCount() const { return InstancedCustomDataFloatCount; }
+	int32 GetInstancedMeshCustomDataFloatCount() const;
 
 	UVertexAnimationManager* GetVertexAnimationManager() const { return VertexAnimationManager; }
+
+	/** Stable-slot instanced renderer backing the non-Niagara path. Null until Initialize runs. */
+	UCrowdInstanceRenderer* GetCrowdInstanceRenderer() const { return CrowdInstanceRenderer; }
 
 private:
 	UPROPERTY(Transient)
@@ -74,23 +86,17 @@ private:
 	TObjectPtr<UStaticMesh> FallbackStaticMesh = nullptr;
 
 	UPROPERTY(Transient)
-	TMap<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>> InstancedMeshComponents;
+	TObjectPtr<UCrowdInstanceRenderer> CrowdInstanceRenderer = nullptr;
 
 	int32 CurrentLODLevel = 0;
 	int32 MaxUnits = 10000;
-	int32 InstancedMeshTopologyRevision = 0;
-	static constexpr int32 InstancedCustomDataFloatCount = 8;
 	float UpdateFrequency = 0.033f;
 	float LastUpdateTime = -BIG_NUMBER;
 	bool bEnableInstancedFallback = true;
 
 	void CreateNiagaraSystem();
 	void UpdateNiagaraData(const TArray<FMassUnitEntityHandle>& Entities);
+	/** Forwards the frame's entities to the stable-slot instanced renderer. */
 	void UpdateInstancedMeshData(const TArray<FMassUnitEntityHandle>& Entities);
-	void SynchronizeInstancedMeshComponent(
-		UInstancedStaticMeshComponent* Component,
-		const TArray<FTransform>& WorldTransforms,
-		const TArray<float>& CustomData);
 	int32 ResolveAnimationIndex(const struct FMassUnitVisualFragment& Visual, const struct FMassUnitStateFragment& State);
-	UInstancedStaticMeshComponent* GetOrCreateInstancedMeshComponent(UStaticMesh* Mesh);
 };

@@ -91,6 +91,37 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Rendering")
 	TSoftObjectPtr<UStaticMesh> FallbackStaticMesh;
 
+	/**
+	 * Distance at which instanced units begin fading out. Zero starts the fade at the end distance,
+	 * producing a hard pop. Only takes effect when InstanceEndCullDistance is above zero.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Rendering|Instancing", meta = (ClampMin = "0", ForceUnits = "cm"))
+	int32 InstanceStartCullDistance = 0;
+
+	/**
+	 * Distance at which instanced units stop drawing entirely, culled per instance on the GPU.
+	 * Zero disables per-instance cull distance and leaves MaxVisibleDistance as the only limit.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Rendering|Instancing", meta = (ClampMin = "0", ForceUnits = "cm"))
+	int32 InstanceEndCullDistance = 0;
+
+	/**
+	 * Whether instanced crowd units cast dynamic shadows.
+	 * A crowd is the worst case for shadow cost - thousands of small movable casters re-rendered per
+	 * cascade - so this defaults to off. Turn it on only for small, close-range unit counts.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Rendering|Instancing")
+	bool bCrowdInstancesCastShadows = false;
+
+	/**
+	 * Distance past which world position offset stops being evaluated on crowd instances.
+	 * The shipped SwarmBot material uses no WPO, so this costs nothing today. It exists for unit
+	 * materials that add camera-facing or wind-style vertex motion: past this range a unit covers a few
+	 * pixels and the per-vertex evaluation is pure cost. Zero never disables WPO.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Rendering|Instancing", meta = (ClampMin = "0", ForceUnits = "cm"))
+	int32 WorldPositionOffsetDisableDistance = 5000;
+
 	/** If no nav data exists, use a direct two-point path instead of rejecting movement requests. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Navigation")
 	bool bFallbackToDirectPath = true;

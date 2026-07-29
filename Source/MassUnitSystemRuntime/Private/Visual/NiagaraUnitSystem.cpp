@@ -2,7 +2,6 @@
 
 #include "Visual/NiagaraUnitSystem.h"
 
-#include "Components/InstancedStaticMeshComponent.h"
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitSystemRuntime.h"
 #include "Engine/StaticMesh.h"
@@ -15,13 +14,13 @@
 #include "NiagaraDataInterfaceArrayFunctionLibrary.h"
 #include "NiagaraFunctionLibrary.h"
 #include "NiagaraSystem.h"
+#include "Visual/CrowdInstanceRenderer.h"
 #include "Visual/VertexAnimationManager.h"
 
 void UNiagaraUnitSystem::Initialize(UWorld* InWorld, UMassEntitySubsystem* InEntitySubsystem)
 {
 	World = InWorld;
 	EntitySubsystem = InEntitySubsystem;
-	InstancedMeshTopologyRevision = 0;
 	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
 	if (Settings)
 	{
@@ -38,6 +37,12 @@ void UNiagaraUnitSystem::Initialize(UWorld* InWorld, UMassEntitySubsystem* InEnt
 	CreateNiagaraSystem();
 	VertexAnimationManager = NewObject<UVertexAnimationManager>(this);
 	VertexAnimationManager->Initialize();
+
+	// The instanced renderer is created even when Niagara is active, so a project can switch
+	// representation at runtime without a subsystem restart. It costs nothing while unused.
+	CrowdInstanceRenderer = NewObject<UCrowdInstanceRenderer>(this);
+	CrowdInstanceRenderer->Initialize(World, EntitySubsystem, FallbackStaticMesh);
+	CrowdInstanceRenderer->SetMaxUnits(MaxUnits);
 }
 
 void UNiagaraUnitSystem::Deinitialize()
@@ -46,19 +51,15 @@ void UNiagaraUnitSystem::Deinitialize()
 	{
 		NiagaraComponent->DestroyComponent();
 	}
-	for (const TPair<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstancedMeshComponents)
+	if (CrowdInstanceRenderer)
 	{
-		if (Pair.Value)
-		{
-			Pair.Value->DestroyComponent();
-		}
+		CrowdInstanceRenderer->Deinitialize();
 	}
 	if (VertexAnimationManager)
 	{
 		VertexAnimationManager->Deinitialize();
 	}
-	InstancedMeshComponents.Reset();
-	InstancedMeshTopologyRevision = 0;
+	CrowdInstanceRenderer = nullptr;
 	VertexAnimationManager = nullptr;
 	NiagaraComponent = nullptr;
 	NiagaraSystemAsset = nullptr;
@@ -109,17 +110,29 @@ void UNiagaraUnitSystem::SetLODLevel(int32 LODLevel)
 	}
 }
 
+int32 UNiagaraUnitSystem::GetInstancedMeshComponentCount() const
+{
+	return CrowdInstanceRenderer ? CrowdInstanceRenderer->GetComponentCount() : 0;
+}
+
 int32 UNiagaraUnitSystem::GetInstancedMeshInstanceCount() const
 {
-	int32 InstanceCount = 0;
-	for (const TPair<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstancedMeshComponents)
-	{
-		if (Pair.Value)
-		{
-			InstanceCount += Pair.Value->GetInstanceCount();
-		}
-	}
-	return InstanceCount;
+	return CrowdInstanceRenderer ? CrowdInstanceRenderer->GetLiveInstanceCount() : 0;
+}
+
+int32 UNiagaraUnitSystem::GetInstancedMeshAllocatedSlotCount() const
+{
+	return CrowdInstanceRenderer ? CrowdInstanceRenderer->GetAllocatedSlotCount() : 0;
+}
+
+int32 UNiagaraUnitSystem::GetInstancedMeshTopologyRevision() const
+{
+	return CrowdInstanceRenderer ? CrowdInstanceRenderer->GetTopologyRevision() : 0;
+}
+
+int32 UNiagaraUnitSystem::GetInstancedMeshCustomDataFloatCount() const
+{
+	return UCrowdInstanceRenderer::GetCustomDataFloatCount();
 }
 
 void UNiagaraUnitSystem::CreateNiagaraSystem()
@@ -217,151 +230,16 @@ void UNiagaraUnitSystem::UpdateNiagaraData(const TArray<FMassUnitEntityHandle>& 
 
 void UNiagaraUnitSystem::UpdateInstancedMeshData(const TArray<FMassUnitEntityHandle>& Entities)
 {
-	if (!EntitySubsystem)
+	if (!CrowdInstanceRenderer)
 	{
 		return;
 	}
-	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
-	TMap<UStaticMesh*, TArray<FTransform>> InstancesByMesh;
-	TMap<UStaticMesh*, TArray<float>> CustomDataByMesh;
-	const int32 Count = FMath::Min(MaxUnits, Entities.Num());
-	for (int32 Index = 0; Index < Count; ++Index)
-	{
-		const FMassEntityHandle NativeHandle = Entities[Index].ToMassEntityHandle();
-		if (!EntityManager.IsEntityValid(NativeHandle))
+	CrowdInstanceRenderer->UpdateInstances(
+		Entities,
+		[this](const FMassUnitVisualFragment& Visual, const FMassUnitStateFragment& State)
 		{
-			continue;
-		}
-		const FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(NativeHandle);
-		const FMassUnitVisualFragment* Visual = EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle);
-		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
-		const FMassUnitTeamFragment* Team = EntityManager.GetFragmentDataPtr<FMassUnitTeamFragment>(NativeHandle);
-		if (!Transform || !Visual || !State || !Team || !Visual->bIsVisible || Visual->bUseSkeletalMesh)
-		{
-			continue;
-		}
-		UStaticMesh* Mesh = Visual->StaticMesh ? Visual->StaticMesh.Get() : FallbackStaticMesh.Get();
-		if (Mesh)
-		{
-			InstancesByMesh.FindOrAdd(Mesh).Add(Transform->GetTransform());
-			TArray<float>& CustomData = CustomDataByMesh.FindOrAdd(Mesh);
-			CustomData.Reserve(InstancesByMesh[Mesh].Num() * InstancedCustomDataFloatCount);
-			CustomData.Add(static_cast<float>(ResolveAnimationIndex(*Visual, *State)));
-			CustomData.Add(State->StateTime);
-			CustomData.Add(static_cast<float>(Visual->LODLevel));
-			CustomData.Add(static_cast<float>(Team->TeamID));
-			CustomData.Add(Team->TeamColor.R);
-			CustomData.Add(Team->TeamColor.G);
-			CustomData.Add(Team->TeamColor.B);
-			CustomData.Add(State->MaxHealth > UE_SMALL_NUMBER ? State->Health / State->MaxHealth : 0.0f);
-		}
-	}
-
-	static const TArray<FTransform> EmptyTransforms;
-	for (const TPair<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstancedMeshComponents)
-	{
-		const TArray<FTransform>* DesiredTransforms = InstancesByMesh.Find(Pair.Key.Get());
-		const TArray<float>* DesiredCustomData = CustomDataByMesh.Find(Pair.Key.Get());
-		static const TArray<float> EmptyCustomData;
-		SynchronizeInstancedMeshComponent(
-			Pair.Value,
-			DesiredTransforms ? *DesiredTransforms : EmptyTransforms,
-			DesiredCustomData ? *DesiredCustomData : EmptyCustomData);
-	}
-	for (const TPair<UStaticMesh*, TArray<FTransform>>& Pair : InstancesByMesh)
-	{
-		UInstancedStaticMeshComponent* Component = GetOrCreateInstancedMeshComponent(Pair.Key);
-		if (!Component)
-		{
-			continue;
-		}
-		if (Component->GetInstanceCount() == 0)
-		{
-			SynchronizeInstancedMeshComponent(Component, Pair.Value, CustomDataByMesh.FindChecked(Pair.Key));
-		}
-	}
-}
-
-void UNiagaraUnitSystem::SynchronizeInstancedMeshComponent(
-	UInstancedStaticMeshComponent* Component,
-	const TArray<FTransform>& WorldTransforms,
-	const TArray<float>& CustomData)
-{
-	if (!Component)
-	{
-		return;
-	}
-
-	const int32 ExistingCount = Component->GetInstanceCount();
-	const int32 DesiredCount = WorldTransforms.Num();
-	const int32 SharedCount = FMath::Min(ExistingCount, DesiredCount);
-	if (SharedCount > 0)
-	{
-		Component->BatchUpdateInstancesTransforms(
-			0,
-			MakeArrayView(WorldTransforms).Left(SharedCount),
-			true,
-			false,
-			false);
-	}
-
-	if (DesiredCount > ExistingCount)
-	{
-		const int32 AddedCount = DesiredCount - ExistingCount;
-		Component->PreAllocateInstancesMemory(AddedCount);
-		TArray<FTransform> AddedTransforms;
-		AddedTransforms.Append(WorldTransforms.GetData() + ExistingCount, AddedCount);
-		Component->AddInstances(AddedTransforms, false, true, false);
-		++InstancedMeshTopologyRevision;
-	}
-	else if (ExistingCount > DesiredCount)
-	{
-		TArray<int32> RemovedIndices;
-		RemovedIndices.Reserve(ExistingCount - DesiredCount);
-		for (int32 InstanceIndex = ExistingCount - 1; InstanceIndex >= DesiredCount; --InstanceIndex)
-		{
-			RemovedIndices.Add(InstanceIndex);
-		}
-		Component->RemoveInstances(RemovedIndices, true);
-		++InstancedMeshTopologyRevision;
-	}
-
-	if (DesiredCount > 0 && CustomData.Num() == DesiredCount * InstancedCustomDataFloatCount)
-	{
-		Component->SetCustomData(0, DesiredCount - 1, CustomData, true);
-	}
-
-	const bool bShouldBeVisible = DesiredCount > 0;
-	if (Component->IsVisible() != bShouldBeVisible)
-	{
-		Component->SetVisibility(bShouldBeVisible);
-	}
-}
-
-UInstancedStaticMeshComponent* UNiagaraUnitSystem::GetOrCreateInstancedMeshComponent(UStaticMesh* Mesh)
-{
-	if (!Mesh || !World)
-	{
-		return nullptr;
-	}
-	if (UInstancedStaticMeshComponent* Existing = InstancedMeshComponents.FindRef(Mesh))
-	{
-		return Existing;
-	}
-	UInstancedStaticMeshComponent* Component = NewObject<UInstancedStaticMeshComponent>(World);
-	if (!Component)
-	{
-		return nullptr;
-	}
-	Component->SetMobility(EComponentMobility::Movable);
-	Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	Component->SetGenerateOverlapEvents(false);
-	Component->SetCanEverAffectNavigation(false);
-	Component->SetNumCustomDataFloats(InstancedCustomDataFloatCount);
-	Component->SetStaticMesh(Mesh);
-	Component->RegisterComponentWithWorld(World);
-	InstancedMeshComponents.Add(Mesh, Component);
-	return Component;
+			return ResolveAnimationIndex(Visual, State);
+		});
 }
 
 int32 UNiagaraUnitSystem::ResolveAnimationIndex(
