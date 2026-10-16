@@ -114,6 +114,44 @@ Every dll-* repo carries the same AI context so any contributor's assistant gets
    world-space shapes and a screen HUD. No per-frame logging.
 6. **Testable cores.** Pure logic in plain C++ classes with automation tests under `DLL<Name>.*`.
 
+## Coding rules (shared by every dll-* plugin)
+
+Each repo's `.github/instructions/cpp.instructions.md` links here and adds only its plugin-specific rules.
+These match the practices of the games we build them for (MetalLegs `CLAUDE.md`).
+
+**Behaviour**
+1. **Event-driven first.** Delegates, OnRep, online/engine callbacks and `FTimerManager` timers. Tick only
+   for continuous simulation, with an early-out on its first line and the lowest workable interval.
+2. **Server-authoritative.** Anything that changes gameplay state, admits players or travels runs on the
+   server/host; clients request. Check `HasAuthority()` / net mode explicitly.
+3. **No per-frame logging, no per-frame RPCs.** `UE_LOG` for one-off events and errors; per-frame values go
+   to the visual debug HUD.
+4. **Visual debug is part of the feature.** Master toggle + granular toggles (`EditCondition`) under a
+   `<Plugin>|Debug` category, a `dll.<Name>.Debug` CVar, world-space shapes and a screen HUD. Colours: white
+   reference, cyan primary output, yellow secondary, green good, red bad, orange intermediate, magenta aim.
+5. **Every early-out reports.** An async operation that cannot start broadcasts its failure, so no UI waits
+   forever.
+
+**Structure**
+6. **Composition over inheritance.** Subsystems, components and interfaces; shallow class trees.
+7. **Data-driven.** Tunables are `UPROPERTY` on data assets or `UDeveloperSettings`, never magic numbers.
+   Soft references for assets.
+8. **Pure rules in plain C++** (or static function libraries without world access) so tests can pin them.
+9. **Extension points instead of game branches** — delegates, virtual hooks, resolver/provider interfaces.
+
+**API and hygiene**
+10. **Non-destructive.** Public `UFUNCTION`/`UPROPERTY`/headers and enum value order are additive between
+    minor versions; renames ship with `[CoreRedirects]` and a CHANGELOG migration note; never `static_cast`
+    between two enums — map with a `switch`.
+11. **Every exposed `UPROPERTY`** has a doc comment (it becomes the tooltip), a `Category`, and clamps/units
+    where numeric. Every public function has a doc comment.
+12. **Header hygiene.** Forward-declare in headers, include in `.cpp`; export macro on public types; weak
+    pointers for world objects held across frames; `UPROPERTY` for owned UObjects.
+13. **Comments say why.** Engine-behaviour claims name the engine file/function they were verified against.
+14. **Honest status.** Never claim "compiles" or "tested" without an artifact (build line, test report);
+    `UNTESTED` is a valid status.
+15. **Only our code and content**, each source file starting with the SPDX header above.
+
 ## Releases
 
 Semantic versioning. Tag releases `vX.Y.Z` on GitHub. Pre-1.0 APIs may change between minors; the

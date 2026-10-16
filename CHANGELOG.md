@@ -9,6 +9,10 @@ Release dates come from the commit that set the `.uplugin` `VersionName`.
 Targeted as 1.5.0. Part of this work was first listed under a "1.5.0" heading, but that version was never
 tagged and `MassUnitSystem.uplugin` still reads `1.4.0`.
 
+### Removed
+- `Gameplay/GASCompanionIntegration.h`, a deprecated header that only forwarded to
+  `Gameplay/MassUnitBehaviorIntegration.h`. Migration: include `Gameplay/MassUnitBehaviorIntegration.h`.
+
 ### Added
 - **Crowd rendering** — `UCrowdInstanceRenderer` replaces the instanced-mesh fallback: stable per-entity
   instance slots (per-instance data can no longer swap between units when one dies), one contiguous transform
