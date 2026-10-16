@@ -1,6 +1,6 @@
 # Integration Guide
 
-This guide applies to Mass Unit System 1.1.0 and Unreal Engine 5.7. For full details, use [setup](docs/setup.md), [usage](docs/usage.md), and the [public API reference](docs/api.md).
+This guide applies to Mass Unit System 1.2.0 and Unreal Engine 5.7. For full details, use the [five-minute quick start](docs/quick-start.md), [setup](docs/setup.md), [usage](docs/usage.md), and the [public API reference](docs/api.md).
 
 ## Integrate
 

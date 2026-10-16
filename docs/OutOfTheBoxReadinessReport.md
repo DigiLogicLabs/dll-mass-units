@@ -1,10 +1,10 @@
 # Out-of-the-Box Readiness Report
 
-Audit baseline: plugin version 1.1.0, Unreal Engine 5.7.2, Win64.
+Audit baseline: plugin version 1.2.0, Unreal Engine 5.7.2, Win64.
 
 ## Result
 
-The plugin now compiles, packages, starts, creates independent native Mass entities, simulates its core lifecycle, renders without plugin content, and shuts down safely in an otherwise empty host project.
+The plugin now compiles, packages, starts, creates independent native Mass entities, simulates its core lifecycle, renders without plugin content, and shuts down safely in an otherwise empty host project. A placeable, non-ticking spawner now provides a zero-asset path from a normal level to a visible moving grid without requiring users to invent bootstrap Blueprint logic.
 
 "Out of the box" means core unit creation, lightweight movement/combat, formation membership, direct or navmesh routing, and a visible instanced representation require no third-party plugin and no bundled art asset. Optional GAS, Behavior Tree, Niagara, skeletal, and VAT workflows still require project-owned assets or objects by design.
 
@@ -36,7 +36,7 @@ The editor automation test `MassUnitSystem.Core.NativeMassLifecycle` completed w
 - 0 failed
 - 0 test warnings or errors
 
-The test verifies two distinct native handles and transforms, team-based combat damage, direct navigation fallback, isolated movement fragments, formation add/remove, explicit entity destruction, and world teardown.
+The test verifies two distinct native handles and transforms, team-based combat damage, direct navigation fallback, isolated movement fragments, formation add/remove, explicit entity destruction, and world teardown. It also creates an asset-free default unit, spawns six units through the placeable spawner, validates preserved-grid movement commands and HISM submission, and confirms ownership cleanup.
 
 ## Distribution checks
 
@@ -45,6 +45,7 @@ The test verifies two distinct native handles and transforms, team-based combat 
 - Runtime/editor module rules compile in packaged non-unity contexts.
 - Windows and Unix build helpers accept an engine root and package outside source `Binaries`.
 - The main setup, usage, API, architecture, troubleshooting, and changelog documents match the implementation.
+- The five-minute quick start documents the same no-asset spawner path covered by automation.
 
 ## Intentional boundaries
 
