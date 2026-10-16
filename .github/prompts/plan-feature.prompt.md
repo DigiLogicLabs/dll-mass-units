@@ -4,7 +4,7 @@ Input: a feature request.
 
 1. Restate it as a requirement for crowds in general, not for one game. If it only makes sense for one game,
    it belongs in that game's bridge; say so.
-2. Read `docs/architecture.md` and `docs/DECISIONS.md`. Name any decision the plan touches.
+2. Read `docs/ARCHITECTURE.md` and `docs/DECISIONS.md`. Name any decision the plan touches.
 3. Decide the home: runtime module, editor module, or a new/existing optional module. Justify.
 4. Design: fragments/tags, processors (which phase, which query), subsystem API, templates/settings,
    Blueprint exposure, debug visualisation, cost at 1k / 10k units and when idle, which budget bounds it,

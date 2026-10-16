@@ -2,7 +2,7 @@
 
 Append-only. Never delete an entry; supersede it with a newer one that says **Supersedes:**.
 Format: `## YYYY-MM-DD — <decision in one line>` then Decision / Reason / Rejected / Refs.
-Decisions before 2026-10-15 are recorded in [changelog.md](changelog.md) and [architecture.md](architecture.md).
+Decisions before 2026-10-15 are recorded in [CHANGELOG.md](../CHANGELOG.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
@@ -42,3 +42,20 @@ are mapped to standard roles in [README.md](README.md); `changelog.md` stays the
 case-insensitive file systems and break links while a docs reorganisation is in flight.
 **Open:** whether to split GAS into an optional `DLLMassUnitsGAS` module (the runtime currently links
 `GameplayAbilities`); a current PRD; a `dll.MassUnits.*` CVar set.
+
+## 2026-10-16 — Docs consolidated to the standard set (supersedes the "keep legacy names" part of the entry above)
+
+**Decision:** `docs/` holds exactly the standard set (README, PRD, ARCHITECTURE, INTEGRATION_GUIDE, TESTING,
+ROADMAP, DECISIONS, MEMORY, AI_WORKFLOW, DLL_PLUGIN_STANDARD, RESEARCH, `guides/`, `sessions/`); `CHANGELOG.md`
+moves to the repo root. Renames use a two-step `git mv` through a temporary name (case-insensitive file systems).
+Current content of `setup`, `quick-start`, `usage`, `api`, `troubleshooting` and `integration_guide` is merged into
+INTEGRATION_GUIDE; `architecture` into ARCHITECTURE; `todo` into ROADMAP; the five research notes and the
+reference-game analysis into RESEARCH; the authoring, VAT, artist and scalability docs become `guides/`.
+Superseded reports and plans (readiness and patch reports, executive summary, technical specification,
+implementation roadmap, proposed architecture, sample-project and usage stubs) are deleted; git history keeps them.
+**Reason:** One place per question; the docs reorganisation that blocked the rename has landed. The old PRD was an
+archived UE 5.6 / GASCompanion concept and is replaced by a current one.
+**Rejected:** keeping legacy files beside the standard ones (two answers to the same question drift apart).
+**Also:** the former changelog heading "1.5.0" was never tagged and `.uplugin` reads 1.4.0, so that work is listed
+under *Unreleased* (targeted as 1.5.0).
+

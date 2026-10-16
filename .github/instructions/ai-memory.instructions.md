@@ -7,8 +7,8 @@ Every meaningful change leaves **Code + Documentation + Memory**.
 
 | Where | What | How |
 |---|---|---|
-| `docs/changelog.md` | Every user-visible change | Under *Unreleased*; breaking changes with a migration note |
-| `docs/architecture.md` | Modules / processors / extension points changed | Edit in place |
+| `CHANGELOG.md` | Every user-visible change | Under *Unreleased*; breaking changes with a migration note |
+| `docs/ARCHITECTURE.md` | Modules / processors / extension points changed | Edit in place |
 | `docs/DECISIONS.md` | A choice between alternatives | Append `## YYYY-MM-DD — <decision>`; supersede, never delete |
 | `docs/MEMORY.md` | Verified non-obvious fact or trap | One dated line; mark `UNVERIFIED` when unproven |
 | `docs/TESTING.md` | New test or manual check | Add to the tables |

@@ -1,6 +1,6 @@
 # Cut a release
 
-1. Confirm `docs/changelog.md` *Unreleased* is complete; move it under `## [X.Y.Z] - YYYY-MM-DD`.
+1. Confirm `CHANGELOG.md` *Unreleased* is complete; move it under `## [X.Y.Z] - YYYY-MM-DD`.
 2. Bump `.uplugin` `Version` (+1) and `VersionName` (`X.Y.Z`); set `EngineVersion` to the verified engine.
 3. Run the standalone build and the `MassUnitSystem` tests; paste the result lines into the release notes.
    Never release on an unverified build.

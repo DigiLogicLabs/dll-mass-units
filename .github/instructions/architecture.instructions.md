@@ -15,5 +15,5 @@ applyTo: "**"
   don't add replicated actors per unit.
 - **Game rules live in the game.** Factions, rewards, audio, crowd replication and targeting are adopter-side
   bridges or a dedicated bridge module, never core branches.
-- Update `docs/architecture.md` when the processor pipeline changes. Check `docs/DECISIONS.md` before proposing
+- Update `docs/ARCHITECTURE.md` when the processor pipeline changes. Check `docs/DECISIONS.md` before proposing
   an alternative to something already decided.

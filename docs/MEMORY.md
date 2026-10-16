@@ -28,3 +28,12 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
 - 2026-10-16 — Supersedes the header line above: all 62 source files now carry the Apache-2.0 SPDX header; README
   carries the dll-mass-units identity, install URL and a License section. Attribution audit: no third-party code,
   assets or URLs in the repo; GASCompanion appears only in archived research docs (never a dependency).
+- 2026-10-16 — `UMassUnitSystemSettings::bEnableDebugVisualization` / `DebugVisualizationDuration` are read by
+  nothing; visual debug is per spawner (`bEnableVisualDebug`) and per crowd/engagement/collective config. No
+  console variables exist yet.
+- 2026-10-16 — All 8 `MassUnitSystem.*` automation tests passed headless in the reference adopter
+  (MetalLegs `Saved/Logs/AutoTest_MassStressStepB_20261016.log`, `EXIT CODE: 0`).
+- 2026-10-16 — Source comments in `MassUnitEntityManager.h` and `MassUnitPresentationTests.cpp` cite
+  `docs/crowd_replication_plan.md`; that file lives in the reference adopter, not this repo.
+- 2026-10-16 — Docs consolidated to the standard set; changelog is now root `CHANGELOG.md` (DECISIONS 2026-10-16).
+

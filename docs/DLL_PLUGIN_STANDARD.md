@@ -25,10 +25,10 @@ breaks every adopter's assets for no benefit). Plugin/module renames use `[CoreR
 ## Repository contents
 
 - `LICENSE` — Apache-2.0 for every dll-* plugin
-- `README.md` — status, supported engine version, install, quick start
+- `README.md` — see *README skeleton* below
 - `CHANGELOG.md` — semantic versioning; `.uplugin` `VersionName` matches the latest entry
 - `CONTRIBUTING.md`
-- `docs/` — `ARCHITECTURE.md`, `ROADMAP.md`, this standard
+- `docs/` — see *Docs set* below
 - `Config/FilterPlugin.ini` — so docs/license ship with packaged plugins
 - Source files start with:
   ```
@@ -38,6 +38,44 @@ breaks every adopter's assets for no benefit). Plugin/module renames use `[CoreR
 
 **Never commit third-party marketplace or licensed content** (sound packs, meshes, vendor Blueprints).
 Repos contain our own code and our own content only.
+
+## README skeleton (same order in every repo)
+
+Keep the README short: it answers *what, why, how do I start*. Everything deeper lives in `docs/`.
+
+1. `# DLL <Name>` + one-line tagline + license/owner line
+2. **Status** callout — version, maturity, what is not done yet
+3. **Why** — the problem, in a few lines
+4. **What's in X.Y.Z** — one table, one row per public piece
+5. **Install** — clone, enable, `Build.cs` dependency, engine version tested
+6. **Quick start** — the smallest working example (C++ and the Blueprint equivalent)
+7. **Design rules** — 3-5 bullets
+8. **Documentation** — link to `docs/README.md` and the AI layer
+9. **Tests** — automation prefix and how to run it
+10. **Sister plugins** — link to this standard
+11. **License**
+
+## Docs set (exactly this; nothing else at `docs/` top level)
+
+| File | Holds |
+|---|---|
+| `README.md` | Index of the files below |
+| `PRD.md` | Goals, users, requirement IDs + status, non-goals |
+| `ARCHITECTURE.md` | Modules, classes, data flow, extension points |
+| `INTEGRATION_GUIDE.md` | Setup and every use case, step by step (the "how to use it" document) |
+| `TESTING.md` | Automation tests, manual matrix, how to record results |
+| `ROADMAP.md` | Versions and what each adds |
+| `DECISIONS.md` | Append-only decision log |
+| `MEMORY.md` | Dated verified facts and traps |
+| `AI_WORKFLOW.md` | The AI session loop |
+| `DLL_PLUGIN_STANDARD.md` | This file, identical in every repo |
+| `RESEARCH.md` *(optional)* | Background research that shaped the design |
+| `PROVENANCE.md` *(only while needed)* | Audit of any file whose origin is not yet cleared |
+| `guides/*.md` *(optional)* | Long task-specific guides linked from INTEGRATION_GUIDE (e.g. an art pipeline) |
+| `sessions/` | Dated hand-offs |
+
+`CHANGELOG.md` lives at the repo root. Superseded reports, plans and old research are deleted (git keeps
+them) or folded into `RESEARCH.md`; they are not left beside the current docs.
 
 ## AI-ready repository layer (required)
 

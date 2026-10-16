@@ -8,7 +8,7 @@
 - [ ] Visual debug / stats for new systems
 - [ ] `MassUnitSystem.*` tests added/updated. Result: <!-- paste counts -->
 - [ ] Standalone `RunUAT BuildPlugin`. Result: <!-- paste the BUILD SUCCESSFUL line -->
-- [ ] `docs/changelog.md` *Unreleased*, DECISIONS / MEMORY / TESTING updated as needed
+- [ ] `CHANGELOG.md` *Unreleased*, DECISIONS / MEMORY / TESTING updated as needed
 - [ ] Only our own content; Apache-2.0 headers on new files
 
 ## Tested in

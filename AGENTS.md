@@ -15,10 +15,10 @@ bounded skeletal-mesh near band, and an optional Gameplay Ability System seam. V
 ## Read before non-trivial work
 
 1. [docs/README.md](docs/README.md) — knowledge-graph index
-2. [docs/architecture.md](docs/architecture.md) — modules, subsystems, processors
+2. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, subsystems, processors
 3. [docs/DECISIONS.md](docs/DECISIONS.md) — the *why*; don't relitigate a recorded decision without new evidence
 4. [docs/MEMORY.md](docs/MEMORY.md) — verified facts and traps
-5. [docs/changelog.md](docs/changelog.md) — what changed, *Unreleased* first
+5. [CHANGELOG.md](CHANGELOG.md) — what changed, *Unreleased* first
 
 ## Layout (current names — see "Pending rename")
 
@@ -52,8 +52,9 @@ build_plugin.bat / build_plugin.sh standalone RunUAT BuildPlugin wrappers
 4. **The plugin does not replicate units.** Network presentation is the adopter's job (for example a relevancy
    bubble replicating compact records). Don't add per-unit replicated actors.
 5. **No game vocabulary.** The plugin owns the `MassUnit.*` tag root; games add leaves.
-6. **Visual debug built in** (settings category *Debug*, `bEnableDebugVisualization`); `stat MassUnitSystem`
-   and CSV category `MassUnits` for cost (arriving with the profiling work). No per-frame logging. A `dll.MassUnits.*` CVar set is owed by the standard.
+6. **Visual debug built in** (per spawner and per crowd/engagement/collective config, `bEnableVisualDebug`; the
+   settings flag `bEnableDebugVisualization` is not wired yet); `stat MassUnitSystem` and CSV category `MassUnits`
+   for cost. No per-frame logging. A `dll.MassUnits.*` CVar set is owed by the standard.
 7. **Non-destructive.** Public API (`UFUNCTION`, `UPROPERTY`, public headers) is additive between minors;
    breaking changes need a changelog migration note and a DECISIONS entry. Renames use `[CoreRedirects]`.
 8. **Testable logic, honest status.** Automation tests under `MassUnitSystem.*` (`DLLMassUnits.*` after the
@@ -68,7 +69,6 @@ build_plugin.bat / build_plugin.sh standalone RunUAT BuildPlugin wrappers
 | `MassUnitSystem.uplugin` | `DLLMassUnits.uplugin` |
 | modules `MassUnitSystemRuntime` / `MassUnitSystemEditor` | `DLLMassUnitsRuntime` / `DLLMassUnitsEditor` |
 | `MASSUNITSYSTEMRUNTIME_API` / `MASSUNITSYSTEMEDITOR_API` | `DLLMASSUNITSRUNTIME_API` / `DLLMASSUNITSEDITOR_API` |
-| `// ... All Rights Reserved.` headers | the Apache-2.0 SPDX header below |
 
 **Class names stay** (`UMassUnitSubsystem`, `UUnitTemplate`, ...): renaming classes breaks every adopter's assets
 for no benefit. After the rename, adopters add to `DefaultEngine.ini`:
@@ -111,7 +111,7 @@ install; a `ConflictingInstance` failure means wait. Full matrix: [docs/TESTING.
 ## Every change leaves Code + Docs + Memory
 
 - Code + tests.
-- Docs: the relevant `docs/*.md`; [docs/changelog.md](docs/changelog.md) under *Unreleased*.
+- Docs: the relevant `docs/*.md`; [CHANGELOG.md](CHANGELOG.md) under *Unreleased*.
 - Memory: a dated line in `docs/MEMORY.md` for non-obvious facts/traps; a `docs/DECISIONS.md` entry for choices
   (append & supersede, never delete). Rules: [.github/instructions/ai-memory.instructions.md](.github/instructions/ai-memory.instructions.md).
 

@@ -15,7 +15,7 @@ applyTo: "Source/**/*.{h,cpp,cs}"
 - **UPROPERTY:** doc comment above (becomes the tooltip), `Category`, `ClampMin/Max`/`ForceUnits` where numeric,
   `EditCondition` for debug sub-toggles. Soft pointers for meshes, materials and Niagara systems.
 - **No per-unit Tick, no per-frame logging.** Processors and the subsystem tick early-out when idle. Time cost
-  with `MASSUNIT_SCOPE_CYCLE` and counts with `MASSUNIT_SET_COUNTER` (`Core/MassUnitStats.h`, arriving with the profiling work; see changelog *Unreleased*).
+  with `MASSUNIT_SCOPE_CYCLE` and counts with `MASSUNIT_SET_COUNTER` (`Core/MassUnitStats.h`).
 - **Lifetime:** weak pointers to world objects held across frames; `UPROPERTY` for owned UObjects; entity
   handles validated before use.
 - **Testability:** decision logic in plain C++ where possible, covered by `MassUnitSystem.*` tests.
