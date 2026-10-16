@@ -124,3 +124,6 @@ $RECYCLE.BIN/
 .Trashes
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
+
+# Personal AI-assistant settings
+.claude/settings.local.json
