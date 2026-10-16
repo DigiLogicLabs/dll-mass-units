@@ -131,6 +131,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Unit Template|Tags")
     FGameplayTagContainer StatusImmunityTags;
 
+    /**
+     * What the unit's body is made of, for the host project's material-keyed systems (gore pools and splats, impact
+     * effects): a flesh tag that bleeds, a metal tag that sparks or leaks oil. The tag vocabulary is the project's;
+     * the plugin never reads it. Empty = the project's crowd default.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Unit Template|Tags")
+    FGameplayTag BodyMaterialTag;
+
     /** Skeletal mesh for the unit */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Unit Template|Visual")
     TSoftObjectPtr<USkeletalMesh> SkeletalMesh;

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - template body material
+
+- `UUnitTemplate::BodyMaterialTag` (additive, `Unit Template|Tags`): what a unit's body is made of, for the host
+  project's material-keyed systems (gore splats, impact effects). The plugin never reads it; the tag vocabulary is the
+  project's. Empty = the host's default.
+
 ## Unreleased - pattern helpers for tools
 
 - `AMassUnitSpawner::ComputePatternOffsets` / `ComputePatternRadius`: static, BlueprintPure versions of the spawner
