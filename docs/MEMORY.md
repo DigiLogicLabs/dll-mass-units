@@ -25,3 +25,6 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
 - Windows is case-insensitive: `docs/prd.md` vs `docs/PRD.md` are one file. Never add a doc differing only by case.
 - Standalone `RunUAT BuildPlugin` needs a short `-Package` path (260-character limit).
 - Only one UnrealBuildTool per engine install; `ConflictingInstance` means wait, not `-NoMutex`.
+- 2026-10-16 — Supersedes the header line above: all 62 source files now carry the Apache-2.0 SPDX header; README
+  carries the dll-mass-units identity, install URL and a License section. Attribution audit: no third-party code,
+  assets or URLs in the repo; GASCompanion appears only in archived research docs (never a dependency).

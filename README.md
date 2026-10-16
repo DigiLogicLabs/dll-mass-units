@@ -1,6 +1,9 @@
-# Mass Unit System for Unreal Engine 5
+# DLL Mass Units
 
-Mass Unit System is a Blueprint- and C++-ready foundation for large groups of lightweight gameplay units using Unreal Engine's native Mass Entity framework.
+**dll-mass-units** (plugin `MassUnitSystem`, displayed as *DLL Mass Units*) is a Digi Logic Labs plugin, open source under
+[Apache-2.0](LICENSE). It was published as `ue5-mass-units-plugin` before 2026-10; the old GitHub URL redirects.
+
+It is a Blueprint- and C++-ready foundation for large groups of lightweight gameplay units using Unreal Engine's native Mass Entity framework.
 
 Version **1.4.0** is verified with **Unreal Engine 5.7.2** on Windows for Editor, Development, and Shipping targets.
 
@@ -25,21 +28,19 @@ Clone or copy the repository below the project's `Plugins` directory:
 
 ```powershell
 Set-Location 'YourProject\Plugins'
-git clone https://github.com/DigiLogicLabs/ue5-mass-units-plugin.git
+git clone https://github.com/DigiLogicLabs/dll-mass-units.git dll-mass-units
 ```
 
 ```text
 YourProject/
   Plugins/
-    ue5-mass-units-plugin/
+    dll-mass-units/
       MassUnitSystem.uplugin
 ```
 
-For this project the expected descriptor is:
-
-```text
-MetalLegsGAS/Plugins/ue5-mass-units-plugin/MassUnitSystem.uplugin
-```
+The folder name is free; Unreal finds the plugin by its `.uplugin`. In MetalLegs it is checked out as
+`Plugins/ue5-mass-units-plugin/` until the planned standard rename moves it to `Plugins/dll-mass-units/`
+(plugin `DLLMassUnits`, modules `DLLMassUnitsRuntime/Editor`, with CoreRedirects; see `docs/DECISIONS.md`).
 
 Then:
 
@@ -395,4 +396,8 @@ The package build checks Editor Development, Game Development, Game Shipping, an
 - Mass entities are not replicated as individual Actors; multiplayer representation/replication is project-specific.
 - UE 5.7.2 is the validated baseline. Recompile and test for another engine minor version.
 
-Copyright Digi Logic Labs LLC. All rights reserved. This repository currently contains no separate license grant.
+## License
+
+Copyright Digi Logic Labs LLC. Licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).
+All source in this repository is original Digi Logic Labs work. Unreal Engine and its Mass Entity framework are
+Epic Games products used under the Unreal Engine EULA and are not part of this repository.

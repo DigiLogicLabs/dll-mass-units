@@ -1,4 +1,5 @@
-// Copyright Digi Logic Labs LLC. All Rights Reserved.
+// Copyright Digi Logic Labs LLC. Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "Entity/UnitTemplate.h"
 

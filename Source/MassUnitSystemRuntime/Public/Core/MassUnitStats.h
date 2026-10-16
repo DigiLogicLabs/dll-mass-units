@@ -1,3 +1,6 @@
+// Copyright Digi Logic Labs LLC. Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
+
 // Mass Unit System - profiling instrumentation.
 //
 // One stat group for the whole plugin, so `stat MassUnitSystem` shows every simulation, crowd and presentation cost

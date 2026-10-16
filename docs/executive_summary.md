@@ -1,6 +1,8 @@
 # UE5 Large-Scale Unit System Plugin - Executive Summary
 
 > Archived concept document from before the native Mass 1.1 implementation. See `README.md` and `OutOfTheBoxReadinessReport.md` for current capabilities and validation.
+> GASCompanion (a third-party plugin) was never a dependency of the shipped code; the integration it describes was
+> replaced by an opt-in bridge to Unreal's built-in GAS (`docs/changelog.md`).
 
 ## Project Overview
 
