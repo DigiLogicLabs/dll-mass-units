@@ -38,7 +38,15 @@ enum class EMassUnitCrowdCue : uint8
 	AmbientInteraction,
 	EngagementStarted,
 	EngagementEnded,
-	Attack
+	Attack,
+	/** Collective behavior: the group was recruited by another group's alert. Appended - existing values keep their order. */
+	Alerted,
+	/** Collective behavior: the group's morale broke and its units are fleeing. */
+	Routed,
+	/** Collective behavior: a routed group recovered its nerve. */
+	Rallied,
+	/** Collective behavior: the group's threat table moved it onto a different target. */
+	TargetChanged
 };
 
 /** Designer-facing controls for one lightweight crowd group. */
@@ -290,6 +298,202 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitPlayerEngagementConfig
 	bool bDrawUnitDestinations = false;
 };
 
+/**
+ * Opt-in collective behavior: how crowd groups share information and nerve.
+ *
+ * The design borrows three ideas from social swarm simulation (influence-weighted spread of
+ * information, contagious sentiment, staggered reaction delays) and rebuilds them as cheap
+ * GROUP-level state on the existing crowd timer. Nothing here runs per unit per frame:
+ *   - Alerts:  an engaging group emits a signal; nearby groups accumulate awareness and join after a
+ *              reaction delay, optionally relaying a weaker signal onward (bounded by relay depth).
+ *   - Morale:  casualties and shocks drain group morale; below a threshold the group routs (units flee
+ *              with a staggered start), spreads fear to nearby allies, and rallies once it recovers.
+ *   - Threat:  damage and proximity build per-actor threat so a group chooses between several players
+ *              with hysteresis instead of locking onto whoever activated it.
+ *
+ * Requires player engagement to be configured on the group. Groups without this config are unchanged.
+ */
+USTRUCT(BlueprintType)
+struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdCollectiveConfig
+{
+	GENERATED_BODY()
+
+	// ------------------------------------------------------------------ Activation
+
+	/** Any damage reported through ReportCrowdUnitDamaged engages the group, whatever its activation mode. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Activation")
+	bool bActivateOnDamage = true;
+
+	// ------------------------------------------------------------------ Alerts (sending)
+
+	/** Emit an alert when this group engages, so nearby groups can join the fight. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts")
+	bool bBroadcastAlerts = true;
+
+	/** Reach of this group's alert. Strength falls off linearly to zero at this distance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bBroadcastAlerts", ClampMin = "1.0", ForceUnits = "cm"))
+	float AlertRadius = 4000.0f;
+
+	/** Influence of this group's alerts at the source. A receiver joins once accumulated awareness reaches its threshold. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bBroadcastAlerts", ClampMin = "0.0", UIMax = "4.0"))
+	float AlertStrength = 1.0f;
+
+	/** Re-emit the alert on this interval while engaged so late or distant groups are drawn in. Zero emits once. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bBroadcastAlerts", ClampMin = "0.0", ForceUnits = "s"))
+	float AlertRebroadcastInterval = 3.0f;
+
+	/** How many hops an alert may be relayed by groups it recruited. Zero means only direct alerts recruit. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bBroadcastAlerts", ClampMin = "0", ClampMax = "8"))
+	int32 MaxAlertRelayDepth = 2;
+
+	/** Strength multiplier per relay hop. Below one, each hop is weaker, so propagation is guaranteed to die out. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bBroadcastAlerts", ClampMin = "0.0", ClampMax = "1.0"))
+	float AlertRelayFalloff = 0.6f;
+
+	// ------------------------------------------------------------------ Alerts (receiving)
+
+	/** Join other groups' fights when their alerts reach this group. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts")
+	bool bReceiveAlerts = true;
+
+	/** Multiplier on incoming alert strength. Higher values make a twitchier group. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bReceiveAlerts", ClampMin = "0.0", UIMax = "4.0"))
+	float AlertSensitivity = 1.0f;
+
+	/** Accumulated awareness needed before this group joins. Weak alerts must stack (several groups, or rebroadcasts). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bReceiveAlerts", ClampMin = "0.01"))
+	float AlertThreshold = 0.5f;
+
+	/** Awareness lost per second, so sub-threshold rumors fade instead of accumulating forever. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bReceiveAlerts", ClampMin = "0.0"))
+	float AwarenessDecayPerSecond = 0.25f;
+
+	/** Shortest delay between crossing the threshold and engaging. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bReceiveAlerts", ClampMin = "0.0", ForceUnits = "s"))
+	float MinAlertReactionDelay = 0.25f;
+
+	/** Longest delay between crossing the threshold and engaging. A spread reads as a ripple, not a switch. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts", meta = (EditCondition = "bReceiveAlerts", ClampMin = "0.0", ForceUnits = "s"))
+	float MaxAlertReactionDelay = 1.5f;
+
+	/** Alerts and fear only travel between groups whose units share a Team ID. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Alerts")
+	bool bSignalsSameTeamOnly = true;
+
+	// ------------------------------------------------------------------ Morale
+
+	/** Track group morale; when it breaks, the group routs and later rallies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale")
+	bool bEnableMorale = true;
+
+	/** Morale lost per fraction of the group killed. 1.5 means losing a third of the group costs half its morale. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", UIMax = "5.0"))
+	float CasualtyMoraleWeight = 1.5f;
+
+	/** Morale regained per second. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0"))
+	float MoraleRecoveryPerSecond = 0.05f;
+
+	/** An engaged group routs when morale falls to this value. Zero means never rout. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", ClampMax = "1.0"))
+	float RoutThreshold = 0.35f;
+
+	/** A routed group rallies once morale recovers to this value (and Min Rout Duration has passed). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", ClampMax = "1.0"))
+	float RallyThreshold = 0.7f;
+
+	/** Minimum time a rout lasts, so a group cannot flicker between fleeing and fighting. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", ForceUnits = "s"))
+	float MinRoutDuration = 4.0f;
+
+	/** Units start fleeing at a deterministic offset within this window, so a rout ripples instead of snapping. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", ForceUnits = "s"))
+	float RoutStaggerTime = 1.0f;
+
+	/** How far a fleeing unit runs from the group's target before choosing again. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "1.0", ForceUnits = "cm"))
+	float FleeDistance = 1500.0f;
+
+	/** Multiplies each unit's template speed while fleeing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.05", ClampMax = "4.0"))
+	float FleeSpeedMultiplier = 1.3f;
+
+	/** Seconds between a fleeing unit's destination choices. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.1", ForceUnits = "s"))
+	float FleeRepathInterval = 1.0f;
+
+	/** Seconds between casualty counts. Counting is O(group size), so this bounds its cost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.05", ForceUnits = "s", AdvancedDisplay))
+	float MoraleEvaluationInterval = 0.25f;
+
+	/** When this group routs, drain the morale of nearby groups that track morale. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale"))
+	bool bBroadcastFear = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale && bBroadcastFear", ClampMin = "1.0", ForceUnits = "cm"))
+	float FearRadius = 2500.0f;
+
+	/** Morale removed from a receiver at the source of a rout; falls off linearly with distance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale && bBroadcastFear", ClampMin = "0.0", ClampMax = "1.0"))
+	float FearStrength = 0.3f;
+
+	/** Multiplier on fear this group RECEIVES. Zero makes it fearless (elite or mindless units). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Morale", meta = (EditCondition = "bEnableMorale", ClampMin = "0.0", UIMax = "4.0"))
+	float FearSusceptibility = 1.0f;
+
+	// ------------------------------------------------------------------ Threat
+
+	/** Keep a threat table and switch targets between actors (multiple players) with hysteresis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat")
+	bool bEnableThreatTargeting = true;
+
+	/** Threat added per point of damage reported against this group. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.0"))
+	float DamageThreatScale = 1.0f;
+
+	/** Players within this distance of the group anchor build threat just by being close. Zero disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.0", ForceUnits = "cm"))
+	float ProximityThreatRadius = 1500.0f;
+
+	/** Threat per second at zero distance; falls off linearly to the proximity radius. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.0"))
+	float ProximityThreatPerSecond = 10.0f;
+
+	/** Seconds for an actor's threat to halve once it stops earning more. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.1", ForceUnits = "s"))
+	float ThreatHalfLife = 6.0f;
+
+	/** A challenger must exceed the current target's threat by this fraction to take over (0.3 = 30% more). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.0", UIMax = "2.0"))
+	float TargetSwitchMargin = 0.3f;
+
+	/** Minimum time between target switches, so the group cannot ping-pong between players. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Threat", meta = (EditCondition = "bEnableThreatTargeting", ClampMin = "0.0", ForceUnits = "s"))
+	float MinTargetSwitchInterval = 2.0f;
+
+	// ------------------------------------------------------------------ Debug
+
+	/** Master toggle for collective-behavior debug drawing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Debug")
+	bool bEnableVisualDebug = false;
+
+	/** Orange circle per alert, purple circle per fear pulse, drawn at emission. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Debug", meta = (EditCondition = "bEnableVisualDebug"))
+	bool bDebugDrawSignals = true;
+
+	/** Morale / awareness / state text above the group anchor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Debug", meta = (EditCondition = "bEnableVisualDebug"))
+	bool bDebugDrawGroupStatus = true;
+
+	/** Magenta line from the group anchor to its current target, with the target's threat value. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Debug", meta = (EditCondition = "bEnableVisualDebug"))
+	bool bDebugDrawThreat = true;
+
+	/** Collective totals in the on-screen debug HUD. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collective|Debug", meta = (EditCondition = "bEnableVisualDebug"))
+	bool bDebugDrawScreenHUD = true;
+};
+
 /** Snapshot of the most recent budgeted crowd update. */
 USTRUCT(BlueprintType)
 struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdStats
@@ -351,6 +555,22 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdStats
 	/** Per-entity navmesh requests issued when shared navigation is explicitly disabled. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
 	int32 PerUnitPathsRequested = 0;
+
+	/** Alert and fear signals delivered to receiving groups by the most recent update. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Collective")
+	int32 CollectiveSignalsProcessed = 0;
+
+	/** Groups that engaged because of an alert during the most recent update. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Collective")
+	int32 GroupsAlerted = 0;
+
+	/** Groups currently routed (morale broken). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Collective")
+	int32 RoutingGroups = 0;
+
+	/** Threat-table target switches during the most recent update. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Collective")
+	int32 TargetSwitches = 0;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
@@ -375,6 +595,19 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
 	int32, SubgroupIndex,
 	EMassUnitCrowdCue, Cue,
 	FVector, WorldLocation);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+	FMassUnitCrowdAlertedSignature,
+	int32, CrowdGroupHandle,
+	AActor*, TargetActor,
+	int32, SourceCrowdGroupHandle);
+
+/**
+ * Project hook deciding whether a crowd of CrowdTeamID may target Candidate. Lets the game apply its own
+ * hostility rules (teams, factions, possession, PvP) without the plugin knowing them. Unset means every
+ * player pawn is a valid target, the behaviour from before the hook existed.
+ */
+DECLARE_DELEGATE_RetVal_TwoParams(bool, FMassUnitCrowdTargetFilter, const AActor* /*Candidate*/, int32 /*CrowdTeamID*/);
 
 /**
  * World-owned, timer-driven behavior LOD for lightweight ambient crowds.
@@ -474,6 +707,75 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Diagnostics")
 	FMassUnitCrowdStats GetCrowdStats() const { return LastStats; }
 
+	// ====================================================================================
+	// COLLECTIVE BEHAVIOR (opt-in) - alerts, morale/rout, threat targeting. See
+	// FMassUnitCrowdCollectiveConfig. Server-authoritative; outcomes reach clients through
+	// whatever already replicates unit transforms and states.
+	// ====================================================================================
+
+	/** Enables or updates collective behavior for a group. Requires engagement to be configured for alerts/threat to act. */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Collective")
+	bool ConfigureCrowdGroupCollectiveBehavior(
+		int32 CrowdGroupHandle,
+		const FMassUnitCrowdCollectiveConfig& Config,
+		bool bEnableCollectiveBehavior = true);
+
+	/**
+	 * Single entry point for "this crowd unit was hurt by that actor". Safe to call for every hit.
+	 * Projectiles and other causers resolve to their instigating pawn. Engages the unit's group like
+	 * NotifyUnitInteracted (OnInteraction groups), or for any activation mode when the group's collective
+	 * config sets bActivateOnDamage, and feeds the group's threat table. Does NOT apply damage.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Collective")
+	bool ReportCrowdUnitDamaged(FMassUnitHandle UnitHandle, float Damage, AActor* DamageInstigator);
+
+	/** Instantly removes morale from a group (leader killed, terrifying ability, big explosion). Negative values boost it. */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Collective")
+	bool ApplyCrowdGroupMoraleShock(int32 CrowdGroupHandle, float MoraleLoss);
+
+	/**
+	 * Raises an alert from the world rather than from a group (alarm, gunshot, explosion). Groups with
+	 * collective behavior that receive alerts react exactly as they would to another group's alert.
+	 * TeamID below zero reaches every team. Returns false when the alert could not be queued.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Collective")
+	bool RaiseCrowdAlertAtLocation(FVector WorldLocation, float Radius, float Strength, AActor* TargetActor, int32 TeamID = -1);
+
+	/** Current morale from zero to one. Groups without morale tracking report one. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Collective")
+	float GetCrowdGroupMorale(int32 CrowdGroupHandle) const;
+
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Collective")
+	bool IsCrowdGroupRouting(int32 CrowdGroupHandle) const;
+
+	/** Accumulated alert awareness; the group engages when this reaches its Alert Threshold. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Collective")
+	float GetCrowdGroupAwareness(int32 CrowdGroupHandle) const;
+
+	/**
+	 * Where the group is, for projects relaying its state to other systems (its living-unit anchor, or its center
+	 * when no unit is alive). Returns false for an unknown group.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Queries")
+	bool GetCrowdGroupAnchor(int32 CrowdGroupHandle, FVector& OutLocation) const;
+
+	/** The Team ID of the group's units (the same value its alerts carry), or INDEX_NONE. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Queries")
+	int32 GetCrowdGroupTeamID(int32 CrowdGroupHandle) const;
+
+	/** The crowd group a unit belongs to, or INDEX_NONE. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Queries")
+	int32 GetUnitCrowdGroup(FMassUnitHandle UnitHandle) const;
+
+	/**
+	 * Installs the project's hostility rule. It is consulted for automatic target acquisition, proximity
+	 * threat, and damage reports: a crowd never engages, or builds threat on, an actor the filter rejects
+	 * (so friendly fire does not turn a friendly crowd). Explicit ActivateCrowdGroupForActor calls are
+	 * not filtered, because a designer asking for a target gets it.
+	 */
+	void SetCrowdTargetFilter(FMassUnitCrowdTargetFilter InFilter) { TargetFilter = MoveTemp(InFilter); }
+	void ClearCrowdTargetFilter() { TargetFilter.Unbind(); }
+
 	/** Fired for non-combat ambient interactions; projects can attach audio, animation, or gameplay reactions. */
 	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
 	FMassUnitCrowdInteractionSignature OnCrowdInteractionStarted;
@@ -492,7 +794,43 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
 	FMassUnitCrowdCueSignature OnCrowdCueRequested;
 
+	/** A group engaged because an alert reached it. SourceCrowdGroupHandle is INDEX_NONE for world alerts. */
+	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
+	FMassUnitCrowdAlertedSignature OnCrowdGroupAlerted;
+
+	/** A group's morale broke. TargetActor is what it is fleeing from (may be null). */
+	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
+	FMassUnitCrowdEngagementSignature OnCrowdGroupRouted;
+
+	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
+	FMassUnitCrowdEngagementSignature OnCrowdGroupRallied;
+
+	/** The threat table moved an engaged group onto a new target. */
+	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Crowd|Events")
+	FMassUnitCrowdEngagementSignature OnCrowdGroupTargetChanged;
+
 private:
+	enum class ECrowdSignalType : uint8
+	{
+		Alert,
+		Fear
+	};
+
+	/** A group-to-group (or world-to-group) message, delivered on the NEXT crowd update so each hop takes a tick. */
+	struct FCrowdSignal
+	{
+		ECrowdSignalType Type = ECrowdSignalType::Alert;
+		int32 SourceGroup = INDEX_NONE;
+		int32 TeamID = INDEX_NONE;
+		FVector Location = FVector::ZeroVector;
+		float Radius = 0.0f;
+		float Strength = 0.0f;
+		TWeakObjectPtr<AActor> Target;
+		int32 RelayDepth = 0;
+	};
+
+	/** Hard cap on queued signals, so a misconfigured relay chain can never grow without bound. */
+	static constexpr int32 MaxPendingSignals = 256;
 	struct FCrowdSubgroupState
 	{
 		FVector Destination = FVector::ZeroVector;
@@ -535,6 +873,41 @@ private:
 		 * mid-attack cannot leak a token and starve the pool. Pruned lazily on acquisition.
 		 */
 		TMap<FMassUnitEntityHandle, float> AttackTokenExpiry;
+
+		// -------- Collective behavior (inert unless bCollectiveEnabled) --------
+		bool bCollectiveEnabled = false;
+		FMassUnitCrowdCollectiveConfig CollectiveConfig;
+		/** Team of the group's units, captured at configure time. INDEX_NONE when unknown (matches any team). */
+		int32 TeamID = INDEX_NONE;
+		float LastCollectiveUpdateTime = -1.0f;
+
+		float Awareness = 0.0f;
+		/** Time at which a recruited group engages; negative when no recruitment is pending. */
+		float PendingAlertActivationTime = -1.0f;
+		TWeakObjectPtr<AActor> PendingAlertTarget;
+		int32 PendingAlertSourceGroup = INDEX_NONE;
+		/** Relay depth a pending recruitment will engage with (incoming signal depth + 1). */
+		int32 PendingRecruitRelayDepth = 0;
+		/** Relay depth the NEXT activation inherits; set only by the recruitment path, consumed by every activation. */
+		int32 PendingAlertRelayDepth = 0;
+		/** Relay depth of the current engagement, reused by periodic rebroadcasts so they stay damped. */
+		int32 EngagementRelayDepth = 0;
+		float NextAlertBroadcastTime = 0.0f;
+		int32 AlertSequence = 0;
+
+		float Morale = 1.0f;
+		bool bRouting = false;
+		float RoutStartTime = 0.0f;
+		/** Next O(group size) evaluation: living count for morale and the cached anchor for signals/threat. */
+		float NextMoraleEvaluationTime = 0.0f;
+		int32 InitialLivingCount = 0;
+		int32 LastLivingCount = 0;
+		/** Living-unit centroid from the last evaluation, so signals and threat avoid recomputing it. */
+		FVector CachedAnchor = FVector::ZeroVector;
+		bool bHasCachedAnchor = false;
+
+		TMap<TWeakObjectPtr<AActor>, float> Threat;
+		float LastTargetSwitchTime = -1000.0f;
 	};
 
 	struct FSpatialEntry
@@ -557,6 +930,16 @@ private:
 	TObjectPtr<UMassUnitNavigationSystem> NavigationSystem = nullptr;
 
 	TMap<int32, FCrowdGroup> Groups;
+
+public:
+	/**
+	 * Registered crowd groups, live (profiling counter; see Core/MassUnitStats.h). Use this for leak checks:
+	 * GetCrowdStats().RegisteredGroups is a snapshot from the last crowd update and keeps its old value after the
+	 * last group is removed, because the update timer stops when idle.
+	 */
+	int32 GetCrowdGroupCount() const { return Groups.Num(); }
+
+private:
 	TMap<FMassUnitEntityHandle, int32> UnitToGroup;
 	FTimerHandle UpdateTimer;
 	FMassUnitCrowdStats LastStats;
@@ -569,6 +952,28 @@ private:
 	bool bUpdatingCrowds = false;
 	TArray<float> SimulationLODDistances;
 	TArray<float> SimulationLODIntervalMultipliers;
+	TArray<FCrowdSignal> PendingSignals;
+
+	// -------- Collective behavior --------
+	/** Once per update, before engagement: decay, morale, threat, signal delivery, recruitment, rebroadcast. */
+	void UpdateCollectiveBehavior(float CurrentTime);
+	void DeliverCrowdSignals(float CurrentTime);
+	void UpdateGroupMorale(FCrowdGroup& Group, float CurrentTime, float DeltaTime);
+	void UpdateGroupThreat(FCrowdGroup& Group, float CurrentTime, float DeltaTime);
+	void EmitCrowdSignal(FCrowdGroup& Group, ECrowdSignalType Type, float Radius, float Strength, AActor* Target, int32 RelayDepth);
+	void QueueCrowdSignal(const FCrowdSignal& Signal);
+	void BeginRout(FCrowdGroup& Group, float CurrentTime);
+	void EndRout(FCrowdGroup& Group, float CurrentTime);
+	bool RetargetCrowdGroup(FCrowdGroup& Group, AActor* NewTarget, float CurrentTime);
+	bool UpdateRoutingUnit(const FSpatialEntry& Entry, FCrowdGroup& Group, float CurrentTime, bool bForceDecision);
+	bool HasRoutReachedUnit(FMassUnitEntityHandle Entity, const FCrowdGroup& Group, float CurrentTime) const;
+	int32 CountLivingUnits(const FCrowdGroup& Group, FVector* OutAnchor = nullptr) const;
+	FVector GetCollectiveAnchor(const FCrowdGroup& Group) const;
+	int32 ResolveGroupTeamID(const FCrowdGroup& Group) const;
+	static AActor* ResolveThreatActor(AActor* Actor);
+	static bool DoesSignalReachTeam(const FCrowdSignal& Signal, const FCrowdGroup& Receiver);
+	void DrawCollectiveDebug(float CurrentTime);
+	static FMassUnitCrowdCollectiveConfig SanitizeCollectiveConfig(const FMassUnitCrowdCollectiveConfig& Config);
 
 	/**
 	 * Takes an attack token for the entity if the pool has room, or renews one it already holds.
@@ -651,7 +1056,12 @@ private:
 		EMassUnitCrowdCue Cue,
 		const FVector& WorldLocation,
 		int32 SubgroupIndex = INDEX_NONE);
-	AActor* FindClosestPlayerTarget(const FVector& Origin, float MaxDistance) const;
+	AActor* FindClosestPlayerTarget(const FVector& Origin, float MaxDistance, int32 CrowdTeamID = INDEX_NONE) const;
+
+	/** True when no filter is installed or the filter accepts Candidate for this team. */
+	bool PassesTargetFilter(const AActor* Candidate, int32 CrowdTeamID) const;
+
+	FMassUnitCrowdTargetFilter TargetFilter;
 	float CalculateClosestLivingUnitDistanceSquared(const FCrowdGroup& Group, const FVector& Location) const;
 	FVector CalculateFollowOffset(FMassUnitEntityHandle Entity, const FCrowdGroup& Group) const;
 	FVector CalculateSubgroupWanderCenter(FMassUnitEntityHandle Entity, const FCrowdGroup& Group) const;

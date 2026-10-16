@@ -132,6 +132,60 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Debug", meta = (ClampMin = "0.0", ForceUnits = "s"))
 	float DebugVisualizationDuration = 0.0f;
 
+	// ------------------------------------------------------------------------------------------------
+	// LAUNCH (knockback, kill flings, near ragdolls) - UMassUnitEntityManager::LaunchUnit
+	// ------------------------------------------------------------------------------------------------
+
+	/** Master switch for LaunchUnit. Off = launches are ignored and units die in place, as before. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch")
+	bool bEnableUnitLaunch = true;
+
+	/** Gravity for airborne units (cm/s^2). Twice real gravity reads as a snappy action-game arc. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "100.0"))
+	float LaunchGravity = 1960.0f;
+
+	/** Launch speed cap (cm/s), applied after the template's LaunchVelocityScale. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0.0"))
+	float MaxLaunchSpeed = 3000.0f;
+
+	/**
+	 * Most units airborne at once. A launch past the cap is refused (the unit is damaged or dies in place), so a
+	 * screen-clearing blast costs a bounded amount. Each airborne unit is one entry in a sparse table.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0"))
+	int32 MaxAirborneUnits = 512;
+
+	/** Seconds a LIVING unit stays down after it lands before it can move or attack again. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0.0", ForceUnits = "s"))
+	float KnockdownSeconds = 0.8f;
+
+	/** Tumble rate of a launched CORPSE (degrees per second, randomised per unit). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0.0"))
+	float CorpseTumbleDegreesPerSecond = 540.0f;
+
+	/** Vertical speed kept by a corpse's single bounce (0 = no bounce). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float CorpseBounceRestitution = 0.3f;
+
+	/**
+	 * One line trace per launch, at the predicted landing point, so a unit knocked off a ledge lands on the ground
+	 * below instead of at its launch height. Off = land at launch height (no traces at all).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch")
+	bool bTraceLandingGround = true;
+
+	/** Landing traces allowed per frame; launches past it land at their launch height (fine on flat ground). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0", EditCondition = "bTraceLandingGround"))
+	int32 MaxLandingTracesPerFrame = 48;
+
+	/**
+	 * Kills launched while their unit is in the skeletal (near) band become real physics ragdolls, at most this many
+	 * at once. Needs a Physics Asset on the template's skeletal mesh. 0 = never; everything else uses the cheap
+	 * tumbling fling, which is what most of a wave gets.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0"))
+	int32 MaxActiveRagdolls = 12;
+
 	/** Optional project catalog. These assets are not spawned automatically. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Units")
 	TArray<TSoftObjectPtr<UUnitConfigDataAsset>> UnitConfigurations;

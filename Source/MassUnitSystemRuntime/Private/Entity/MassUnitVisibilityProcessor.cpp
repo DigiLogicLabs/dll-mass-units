@@ -1,6 +1,7 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Entity/MassUnitVisibilityProcessor.h"
+#include "Core/MassUnitStats.h"
 
 #include "Config/MassUnitSystemSettings.h"
 #include "Engine/World.h"
@@ -26,8 +27,11 @@ void UMassUnitVisibilityProcessor::ConfigureQueries(const TSharedRef<FMassEntity
 	EntityQuery.AddRequirement<FMassUnitVisualizationLODFragment>(EMassFragmentAccess::ReadWrite);
 }
 
+DECLARE_CYCLE_STAT(TEXT("Visibility / LOD Processor"), STAT_MassUnit_VisibilityProcessor, STATGROUP_MassUnitSystem);
+
 void UMassUnitVisibilityProcessor::Execute(FMassEntityManager& EntityManager, FMassExecutionContext& Context)
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_VisibilityProcessor);
 	UWorld* World = EntityManager.GetWorld();
 	if (!World || World->GetNetMode() == NM_DedicatedServer)
 	{

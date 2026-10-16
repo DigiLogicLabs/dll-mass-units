@@ -1,6 +1,11 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Entity/MassUnitEntityManager.h"
+#include "Core/MassUnitStats.h"
+
+DECLARE_CYCLE_STAT(TEXT("Launches (airborne units)"), STAT_MassUnit_TickLaunches, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Timed Statuses"), STAT_MassUnit_TickStatuses, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Prune Invalid Units"), STAT_MassUnit_PruneInvalidUnits, STATGROUP_MassUnitSystem);
 
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
@@ -17,6 +22,12 @@
 #include "MassUnitCommonFragments.h"
 #include "TimerManager.h"
 
+namespace
+{
+	/** Status timers advance at 10 Hz; DoT periods shorter than this are quantised to it. */
+	constexpr float StatusTickInterval = 0.1f;
+}
+
 void UMassUnitEntityManager::Initialize(UMassEntitySubsystem* InEntitySubsystem)
 {
 	EntitySubsystem = InEntitySubsystem;
@@ -31,6 +42,10 @@ void UMassUnitEntityManager::Deinitialize()
 	AllUnits.Reset();
 	UnitTypeMap.Reset();
 	TeamMap.Reset();
+	UnitsWithStatus.Reset();
+	NextStatusTickTime = 0.0f;
+	ActiveLaunches.Reset();
+	PendingRagdollRequests.Reset();
 	UnitArchetype = FMassArchetypeHandle();
 	RuntimeDefaultTemplate = nullptr;
 	EntitySubsystem = nullptr;
@@ -43,14 +58,74 @@ FMassUnitHandle UMassUnitEntityManager::CreateUnitFromTemplate(UUnitTemplate* Te
 
 FMassUnitHandle UMassUnitEntityManager::CreateDefaultUnit(const FTransform& SpawnTransform)
 {
+	return CreateUnitFromTemplate(GetOrCreateDefaultTemplate(), SpawnTransform);
+}
+
+UUnitTemplate* UMassUnitEntityManager::GetOrCreateDefaultTemplate()
+{
 	if (!RuntimeDefaultTemplate)
 	{
 		RuntimeDefaultTemplate = NewObject<UUnitTemplate>(this, TEXT("RuntimeDefaultUnitTemplate"), RF_Transient);
 	}
-	return CreateUnitFromTemplate(RuntimeDefaultTemplate, SpawnTransform);
+	return RuntimeDefaultTemplate;
+}
+
+TArray<FMassUnitHandle> UMassUnitEntityManager::CreateUnitsFromTemplate(
+	UUnitTemplate* Template,
+	const TArray<FTransform>& SpawnTransforms,
+	const FMassUnitBatchSpawnOptions& Options)
+{
+	TArray<FMassUnitHandle> NewUnits;
+	if (SpawnTransforms.IsEmpty())
+	{
+		return NewUnits;
+	}
+	UUnitTemplate* ResolvedTemplate = Template ? Template : GetOrCreateDefaultTemplate();
+
+	// Load the template's soft references once; every unit after the first then resolves them from memory.
+	ResolvedTemplate->SkeletalMesh.LoadSynchronous();
+	ResolvedTemplate->AnimationBlueprintClass.LoadSynchronous();
+	ResolvedTemplate->StaticMesh.LoadSynchronous();
+	ResolvedTemplate->VertexAnimationTexture.LoadSynchronous();
+	ResolvedTemplate->NormalMapTexture.LoadSynchronous();
+
+	int32 Budget = SpawnTransforms.Num();
+	if (const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>())
+	{
+		Budget = FMath::Clamp(Settings->MaxUnits - AllUnits.Num(), 0, Budget);
+		if (Budget < SpawnTransforms.Num())
+		{
+			UE_LOG(LogMassUnitSystem, Warning, TEXT("Batch spawn clipped to %d of %d units by the unit limit (%d)"),
+				Budget, SpawnTransforms.Num(), Settings->MaxUnits);
+		}
+	}
+	NewUnits.Reserve(Budget);
+	AllUnits.Reserve(AllUnits.Num() + Budget);
+
+	FRandomStream VariantStream(Options.RandomSeed);
+	for (int32 Index = 0; Index < Budget; ++Index)
+	{
+		const FMassUnitEntityHandle Handle = CreateUnitInternal(
+			ResolvedTemplate, SpawnTransforms[Index], &Options, Options.bSeedVariants ? &VariantStream : nullptr);
+		if (!Handle.IsValid())
+		{
+			break;
+		}
+		NewUnits.Add(FMassUnitHandle(Handle));
+	}
+	return NewUnits;
 }
 
 FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitFromTemplateInternal(UUnitTemplate* Template, const FTransform& SpawnTransform)
+{
+	return CreateUnitInternal(Template, SpawnTransform, nullptr, nullptr);
+}
+
+FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitInternal(
+	UUnitTemplate* Template,
+	const FTransform& SpawnTransform,
+	const FMassUnitBatchSpawnOptions* Options,
+	FRandomStream* VariantStream)
 {
 	if (!Template || !EntitySubsystem)
 	{
@@ -93,14 +168,26 @@ FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitFromTemplateInternal(UUn
 	State.MoveSpeed = FMath::Max(0.0f, Template->MoveSpeed);
 	State.AttackRange = FMath::Max(0.0f, Template->AttackRange);
 	State.AttackCooldown = FMath::Max(0.0f, Template->AttackCooldown);
+	State.AttackImpactDelay = FMath::Max(0.0f, Template->AttackImpactDelay);
 
 	FMassUnitTeamFragment& Team = EntityView.GetFragmentData<FMassUnitTeamFragment>();
 	Team.TeamID = Template->TeamID;
 	Team.TeamColor = Template->TeamColor;
 	Team.TeamFaction = Template->TeamFaction;
+	if (Options && Options->bOverrideTeam)
+	{
+		Team.TeamID = Options->TeamID;
+		if (Options->bOverrideTeamColor)
+		{
+			Team.TeamColor = Options->TeamColor;
+		}
+	}
 
 	FMassUnitAbilityFragment& Ability = EntityView.GetFragmentData<FMassUnitAbilityFragment>();
 	Ability.DefaultAbilityTags = Template->DefaultAbilities;
+	Ability.LooseTags = Template->GrantedTags;
+	Ability.StatusImmunityTags = Template->StatusImmunityTags;
+	Ability.RebuildTags();
 
 	FMassUnitVisualFragment& Visual = EntityView.GetFragmentData<FMassUnitVisualFragment>();
 	Visual.SkeletalMesh = Template->SkeletalMesh.LoadSynchronous();
@@ -114,6 +201,12 @@ FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitFromTemplateInternal(UUn
 	Visual.VertexAnimationTexture = Template->VertexAnimationTexture.LoadSynchronous();
 	Visual.NormalMapTexture = Template->NormalMapTexture.LoadSynchronous();
 	Visual.AnimationTags = Template->AnimationTags;
+	Visual.SourceTemplate = Template;
+	Visual.RunSpeedThreshold = FMath::Max(0.0f, Template->RunSpeedThreshold);
+	// Same golden-ratio value the renderer always derived from the entity index, now stored so it can be replicated.
+	Visual.VariantSeed = VariantStream
+		? VariantStream->FRand()
+		: FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.6180339887f);
 	Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
 	Visual.TargetAnimation = Visual.CurrentAnimation;
 	Visual.bUseSkeletalMesh = false;
@@ -347,6 +440,7 @@ bool UMassUnitEntityManager::SetUnitTarget(FMassUnitHandle UnitHandle, FMassUnit
 
 void UMassUnitEntityManager::PruneInvalidUnits()
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_PruneInvalidUnits);
 	if (!EntitySubsystem)
 	{
 		AllUnits.Reset();
@@ -373,6 +467,7 @@ void UMassUnitEntityManager::PruneInvalidUnits()
 void UMassUnitEntityManager::RemoveHandleFromIndexes(FMassUnitEntityHandle EntityHandle)
 {
 	AllUnits.Remove(EntityHandle);
+	UnitsWithStatus.Remove(EntityHandle.ToMassEntityHandle());
 	for (auto It = UnitTypeMap.CreateIterator(); It; ++It)
 	{
 		It.Value().Remove(EntityHandle);
@@ -615,4 +710,797 @@ TArray<FMassUnitHandle> UMassUnitEntityManager::GetUnitsInRadius(
 		}
 	}
 	return Result;
+}
+
+// ============================================================================
+// Gameplay tags and statuses
+// ============================================================================
+
+float UMassUnitEntityManager::GetStatusClockTime() const
+{
+	const UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	return World ? World->GetTimeSeconds() : 0.0f;
+}
+
+void UMassUnitEntityManager::RefreshStatusEffects(
+	FMassUnitAbilityFragment& Ability,
+	FMassUnitStateFragment& State,
+	FMassUnitVisualFragment* Visual) const
+{
+	float SpeedMultiplier = 1.0f;
+	bool bStunned = false;
+	for (const FMassUnitStatusEffect& Status : Ability.ActiveStatuses)
+	{
+		SpeedMultiplier *= FMath::Max(0.0f, Status.MoveSpeedMultiplier);
+		bStunned |= Status.bStuns;
+	}
+	State.StatusMoveSpeedMultiplier = SpeedMultiplier;
+	Ability.RebuildTags();
+
+	if (State.CurrentState == EMassUnitState::Dead)
+	{
+		return;
+	}
+	if (bStunned && State.CurrentState != EMassUnitState::Stunned)
+	{
+		// A stun interrupts a swing in progress; its damage never lands.
+		State.CurrentState = EMassUnitState::Stunned;
+		State.StateTime = 0.0f;
+		State.PendingAttackDamage = 0.0f;
+		if (Visual)
+		{
+			Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationStun();
+		}
+	}
+	else if (!bStunned && State.CurrentState == EMassUnitState::Stunned)
+	{
+		State.CurrentState = EMassUnitState::Idle;
+		State.StateTime = 0.0f;
+		if (Visual)
+		{
+			Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
+		}
+	}
+}
+
+bool UMassUnitEntityManager::ApplyUnitStatus(FMassUnitHandle UnitHandle, const FMassUnitStatusEffect& Status, AActor* StatusInstigator)
+{
+	if (!IsUnitValid(UnitHandle) || !Status.StatusTag.IsValid())
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	if (!Ability || !State || State->CurrentState == EMassUnitState::Dead)
+	{
+		return false;
+	}
+	if (Status.StatusTag.MatchesAny(Ability->StatusImmunityTags))
+	{
+		return false;
+	}
+
+	const float Now = GetStatusClockTime();
+	FMassUnitStatusEffect* Existing = Ability->ActiveStatuses.FindByPredicate(
+		[&Status](const FMassUnitStatusEffect& Active) { return Active.StatusTag == Status.StatusTag; });
+	const bool bIsNew = Existing == nullptr;
+	// Refresh never SHORTENS: a weaker or briefer re-application (burning ground re-arming every pulse over a 6 s
+	// flamethrower burn) keeps the later expiry, as two GE handles would coexist on an actor. Permanent stays permanent.
+	const bool bWasPermanent = Existing && Existing->IsPermanent();
+	const float PreviousExpireTime = Existing ? Existing->ExpireTime : 0.0f;
+	const float PreviousDuration = Existing ? Existing->Duration : 0.0f;
+	if (Existing)
+	{
+		const int32 PreviousStacks = Existing->Stacks;
+		const float PreviousNextTick = Existing->NextTickTime;
+		const bool bWasTicking = Existing->DamagePerPeriod > 0.0f;
+		*Existing = Status;
+		Existing->Stacks = Status.bStacks ? FMath::Min(FMath::Max(1, Status.MaxStacks), PreviousStacks + 1) : 1;
+		// Refreshing must not reset the tick phase, or re-applying faster than the period would never tick.
+		// A status that was NOT ticking never advanced its phase, so it starts a fresh one instead of
+		// paying out every period since it was first applied.
+		Existing->NextTickTime = bWasTicking
+			? PreviousNextTick
+			: Now + FMath::Max(0.05f, Status.Period);
+	}
+	else
+	{
+		Existing = &Ability->ActiveStatuses.Add_GetRef(Status);
+		Existing->Stacks = 1;
+		Existing->NextTickTime = Now + FMath::Max(0.05f, Status.Period);
+	}
+	Existing->Instigator = StatusInstigator;
+	if (!bIsNew && bWasPermanent)
+	{
+		Existing->Duration = PreviousDuration;
+		Existing->ExpireTime = 0.0f;
+	}
+	else
+	{
+		Existing->ExpireTime = Status.IsPermanent() ? 0.0f : FMath::Max(PreviousExpireTime, Now + Status.Duration);
+	}
+
+	RefreshStatusEffects(*Ability, *State, EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle));
+	UnitsWithStatus.Add(NativeHandle);
+	if (bIsNew)
+	{
+		OnUnitStatusChanged.Broadcast(UnitHandle, Status.StatusTag, true);
+	}
+	return true;
+}
+
+bool UMassUnitEntityManager::RemoveUnitStatus(FMassUnitHandle UnitHandle, FGameplayTag StatusTag)
+{
+	if (!StatusTag.IsValid() || !IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	if (!Ability || !State)
+	{
+		return false;
+	}
+	const int32 RemovedCount = Ability->ActiveStatuses.RemoveAll(
+		[&StatusTag](const FMassUnitStatusEffect& Status) { return Status.StatusTag == StatusTag; });
+	if (RemovedCount == 0)
+	{
+		return false;
+	}
+	RefreshStatusEffects(*Ability, *State, EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle));
+	if (Ability->ActiveStatuses.IsEmpty())
+	{
+		UnitsWithStatus.Remove(NativeHandle);
+	}
+	OnUnitStatusChanged.Broadcast(UnitHandle, StatusTag, false);
+	return true;
+}
+
+int32 UMassUnitEntityManager::RemoveUnitStatusesMatching(FMassUnitHandle UnitHandle, FGameplayTagContainer StatusTags)
+{
+	if (!IsUnitValid(UnitHandle) || StatusTags.IsEmpty())
+	{
+		return 0;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	if (!Ability || !State)
+	{
+		return 0;
+	}
+
+	TArray<FGameplayTag> Removed;
+	Ability->ActiveStatuses.RemoveAll([&StatusTags, &Removed](const FMassUnitStatusEffect& Status)
+	{
+		if (Status.StatusTag.MatchesAny(StatusTags))
+		{
+			Removed.Add(Status.StatusTag);
+			return true;
+		}
+		return false;
+	});
+	if (Removed.IsEmpty())
+	{
+		return 0;
+	}
+	RefreshStatusEffects(*Ability, *State, EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle));
+	if (Ability->ActiveStatuses.IsEmpty())
+	{
+		UnitsWithStatus.Remove(NativeHandle);
+	}
+	for (const FGameplayTag& Tag : Removed)
+	{
+		OnUnitStatusChanged.Broadcast(UnitHandle, Tag, false);
+	}
+	return Removed.Num();
+}
+
+bool UMassUnitEntityManager::StunUnit(FMassUnitHandle UnitHandle, float Duration, AActor* StunInstigator)
+{
+	if (Duration <= 0.0f)
+	{
+		return false;
+	}
+	FMassUnitStatusEffect Stun;
+	Stun.StatusTag = UE::MassUnitSystem::Tags::StatusStunned();
+	Stun.Duration = Duration;
+	Stun.bStuns = true;
+	Stun.MoveSpeedMultiplier = 0.0f;
+	return ApplyUnitStatus(UnitHandle, Stun, StunInstigator);
+}
+
+bool UMassUnitEntityManager::GetUnitPresentation(FMassUnitHandle UnitHandle, EMassUnitState& OutState, uint8& OutSwingCounter) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitStateFragment* State = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitStateFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!State)
+	{
+		return false;
+	}
+	OutState = State->CurrentState;
+	OutSwingCounter = static_cast<uint8>(State->AttackSerial & 0x1F);
+	return true;
+}
+
+bool UMassUnitEntityManager::ApplyPresentationState(FMassUnitHandle UnitHandle, EMassUnitState NewState, uint8 SwingCounter)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	FMassUnitVisualFragment* Visual = EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle);
+	if (!State || !Visual || State->CurrentState == EMassUnitState::Dead || NewState == EMassUnitState::Dead)
+	{
+		return false;   // death arrives through health; a corpse is never revived by presentation
+	}
+	SwingCounter &= 0x1F;
+	switch (NewState)
+	{
+	case EMassUnitState::Attacking:
+		if (State->CurrentState != EMassUnitState::Attacking || State->PresentationSwingCounter != SwingCounter)
+		{
+			// A new swing: restart the clip (renderer start stamp + pooled skeletal mesh serial). No damage is queued.
+			State->CurrentState = EMassUnitState::Attacking;
+			State->StateTime = 0.0f;
+			++State->AttackSerial;
+			State->PendingAttackDamage = 0.0f;
+		}
+		Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationAttack();
+		break;
+	case EMassUnitState::Stunned:
+		if (State->CurrentState != EMassUnitState::Stunned)
+		{
+			State->CurrentState = EMassUnitState::Stunned;
+			State->StateTime = 0.0f;
+			State->PendingAttackDamage = 0.0f;
+		}
+		Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationStun();
+		break;
+	default:
+		// Locomotion and anything else: leave a replicated attack/stun and let the movement processor choose
+		// Walk/Run/Idle from the puppet's own velocity.
+		if (State->CurrentState == EMassUnitState::Attacking || State->CurrentState == EMassUnitState::Stunned)
+		{
+			State->CurrentState = EMassUnitState::Idle;
+			State->StateTime = 0.0f;
+			Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
+		}
+		break;
+	}
+	State->PresentationSwingCounter = SwingCounter;
+	return true;
+}
+
+float UMassUnitEntityManager::GetUnitVariantSeed(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return -1.0f;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Visual ? Visual->VariantSeed : -1.0f;
+}
+
+bool UMassUnitEntityManager::SetUnitVariantSeed(FMassUnitHandle UnitHandle, float Seed)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassUnitVisualFragment* Visual = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	Visual->VariantSeed = FMath::Clamp(Seed, 0.0f, 1.0f);
+	return true;
+}
+
+TArray<FMassUnitStatusEffect> UMassUnitEntityManager::GetUnitStatuses(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return {};
+	}
+	const FMassUnitAbilityFragment* Ability = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitAbilityFragment>(UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Ability ? Ability->ActiveStatuses : TArray<FMassUnitStatusEffect>();
+}
+
+bool UMassUnitEntityManager::AddUnitTags(FMassUnitHandle UnitHandle, FGameplayTagContainer Tags)
+{
+	if (!IsUnitValid(UnitHandle) || Tags.IsEmpty())
+	{
+		return false;
+	}
+	FMassUnitAbilityFragment* Ability = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitAbilityFragment>(UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Ability)
+	{
+		return false;
+	}
+	Ability->LooseTags.AppendTags(Tags);
+	Ability->RebuildTags();
+	return true;
+}
+
+bool UMassUnitEntityManager::RemoveUnitTags(FMassUnitHandle UnitHandle, FGameplayTagContainer Tags)
+{
+	if (!IsUnitValid(UnitHandle) || Tags.IsEmpty())
+	{
+		return false;
+	}
+	FMassUnitAbilityFragment* Ability = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitAbilityFragment>(UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Ability)
+	{
+		return false;
+	}
+	Ability->LooseTags.RemoveTags(Tags);
+	Ability->RebuildTags();
+	return true;
+}
+
+bool UMassUnitEntityManager::GetUnitTags(FMassUnitHandle UnitHandle, FGameplayTagContainer& OutTags) const
+{
+	OutTags.Reset();
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitAbilityFragment* Ability = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitAbilityFragment>(UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Ability)
+	{
+		return false;
+	}
+	OutTags = Ability->OwnedTags;
+	return true;
+}
+
+bool UMassUnitEntityManager::UnitHasTag(FMassUnitHandle UnitHandle, FGameplayTag Tag) const
+{
+	FGameplayTagContainer Owned;
+	return Tag.IsValid() && GetUnitTags(UnitHandle, Owned) && Owned.HasTag(Tag);
+}
+
+bool UMassUnitEntityManager::UnitHasAnyTags(FMassUnitHandle UnitHandle, FGameplayTagContainer Tags) const
+{
+	FGameplayTagContainer Owned;
+	return !Tags.IsEmpty() && GetUnitTags(UnitHandle, Owned) && Owned.HasAny(Tags);
+}
+
+bool UMassUnitEntityManager::UnitMatchesTagQuery(FMassUnitHandle UnitHandle, const FGameplayTagQuery& Query) const
+{
+	FGameplayTagContainer Owned;
+	return !Query.IsEmpty() && GetUnitTags(UnitHandle, Owned) && Query.Matches(Owned);
+}
+
+TArray<FMassUnitHandle> UMassUnitEntityManager::FindUnitsMatchingTagQuery(
+	const FGameplayTagQuery& Query,
+	FVector WorldLocation,
+	float Radius,
+	bool bUse3DDistance) const
+{
+	TArray<FMassUnitHandle> Result;
+	if (!EntitySubsystem || Query.IsEmpty())
+	{
+		return Result;
+	}
+	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
+	const float RadiusSquared = FMath::Square(Radius);
+	for (const FMassUnitEntityHandle& Handle : AllUnits)
+	{
+		const FMassEntityHandle NativeHandle = Handle.ToMassEntityHandle();
+		if (!EntityManager.IsEntityValid(NativeHandle))
+		{
+			continue;
+		}
+		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+		const FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle);
+		if (!State || !Ability || State->CurrentState == EMassUnitState::Dead)
+		{
+			continue;
+		}
+		if (Radius > 0.0f)
+		{
+			const FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(NativeHandle);
+			if (!Transform)
+			{
+				continue;
+			}
+			const FVector Location = Transform->GetTransform().GetLocation();
+			const float DistanceSquared = bUse3DDistance ? FVector::DistSquared(Location, WorldLocation) : FVector::DistSquared2D(Location, WorldLocation);
+			if (DistanceSquared > RadiusSquared)
+			{
+				continue;
+			}
+		}
+		if (Query.Matches(Ability->OwnedTags))
+		{
+			Result.Add(FMassUnitHandle(Handle));
+		}
+	}
+	return Result;
+}
+
+void UMassUnitEntityManager::TickStatuses(float CurrentTime)
+{
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_TickStatuses);
+	if (UnitsWithStatus.IsEmpty() || !EntitySubsystem || CurrentTime < NextStatusTickTime)
+	{
+		return;
+	}
+	NextStatusTickTime = CurrentTime + StatusTickInterval;
+
+	struct FPendingDamage
+	{
+		FMassUnitHandle Unit;
+		FGameplayTag Tag;
+		FGameplayTag DamageType;
+		float Damage = 0.0f;
+		TWeakObjectPtr<AActor> Instigator;
+	};
+	struct FPendingRemoval
+	{
+		FMassUnitHandle Unit;
+		FGameplayTag Tag;
+	};
+	TArray<FPendingDamage> DamageEvents;
+	TArray<FPendingRemoval> RemovedEvents;
+	TArray<FMassEntityHandle> Finished;
+
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	for (const FMassEntityHandle NativeHandle : UnitsWithStatus)
+	{
+		FMassUnitAbilityFragment* Ability = EntityManager.IsEntityValid(NativeHandle)
+			? EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle)
+			: nullptr;
+		FMassUnitStateFragment* State = Ability ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle) : nullptr;
+		if (!Ability || !State)
+		{
+			Finished.Add(NativeHandle);
+			continue;
+		}
+		const FMassUnitHandle Unit(NativeHandle);
+		if (State->CurrentState == EMassUnitState::Dead)
+		{
+			// Statuses do not outlive the unit; clearing them keeps a burning corpse from ticking.
+			for (const FMassUnitStatusEffect& Status : Ability->ActiveStatuses)
+			{
+				RemovedEvents.Add({Unit, Status.StatusTag});
+			}
+			Ability->ActiveStatuses.Reset();
+			Ability->RebuildTags();
+			State->StatusMoveSpeedMultiplier = 1.0f;
+			Finished.Add(NativeHandle);
+			continue;
+		}
+
+		bool bChanged = false;
+		for (int32 Index = Ability->ActiveStatuses.Num() - 1; Index >= 0; --Index)
+		{
+			FMassUnitStatusEffect& Status = Ability->ActiveStatuses[Index];
+			const bool bExpired = !Status.IsPermanent() && CurrentTime >= Status.ExpireTime;
+			if (Status.DamagePerPeriod > 0.0f)
+			{
+				const float Period = FMath::Max(0.05f, Status.Period);
+				// A tick due exactly at expiry still lands; that is how a 3 s burn with a 1 s period deals 3 ticks.
+				const float LastTickTime = Status.IsPermanent()
+					? CurrentTime
+					: FMath::Min(CurrentTime, Status.ExpireTime + UE_KINDA_SMALL_NUMBER);
+				while (Status.NextTickTime <= LastTickTime)
+				{
+					DamageEvents.Add({Unit, Status.StatusTag, Status.DamageTypeTag, Status.DamagePerPeriod * static_cast<float>(FMath::Max(1, Status.Stacks)), Status.Instigator});
+					Status.NextTickTime += Period;
+				}
+			}
+			if (bExpired)
+			{
+				RemovedEvents.Add({Unit, Status.StatusTag});
+				Ability->ActiveStatuses.RemoveAtSwap(Index, EAllowShrinking::No);
+				bChanged = true;
+			}
+		}
+		if (bChanged)
+		{
+			RefreshStatusEffects(*Ability, *State, EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(NativeHandle));
+		}
+		if (Ability->ActiveStatuses.IsEmpty())
+		{
+			Finished.Add(NativeHandle);
+		}
+	}
+	for (const FMassEntityHandle Handle : Finished)
+	{
+		UnitsWithStatus.Remove(Handle);
+	}
+
+	// Events go out after the fragment pass: listeners may apply damage or new statuses, which would
+	// otherwise mutate the set and the arrays being walked.
+	for (const FPendingRemoval& Removal : RemovedEvents)
+	{
+		OnUnitStatusChanged.Broadcast(Removal.Unit, Removal.Tag, false);
+	}
+	for (const FPendingDamage& Event : DamageEvents)
+	{
+		if (OnUnitStatusDamageTick.IsBound())
+		{
+			OnUnitStatusDamageTick.Broadcast(Event.Unit, Event.Tag, Event.DamageType, Event.Damage, Event.Instigator.Get());
+		}
+		else
+		{
+			ApplyDamageInternal(Event.Unit.EntityHandle, Event.Damage, Event.Instigator.Get());
+		}
+	}
+}
+
+// ================================================================================================
+// LAUNCH
+// ================================================================================================
+
+bool UMassUnitEntityManager::LaunchUnit(FMassUnitHandle UnitHandle, FVector Velocity, AActor* LaunchInstigator, bool bApplyTemplateScale)
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	if (!Settings || !Settings->bEnableUnitLaunch || !IsUnitValid(UnitHandle) || Velocity.IsNearlyZero())
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle);
+	const FMassUnitVisualFragment* Visual = EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(Handle);
+	if (!Transform || !State)
+	{
+		return false;
+	}
+
+	const bool bDead = State->CurrentState == EMassUnitState::Dead;
+	if (bApplyTemplateScale)
+	{
+		const UUnitTemplate* Template = Visual ? Visual->SourceTemplate.Get() : nullptr;
+		const float Scale = Template ? Template->LaunchVelocityScale : 1.0f;
+		if (Scale <= 0.0f)
+		{
+			return false;   // heavies and bosses stand their ground
+		}
+		// A living unit immune to the Launched status (immune to MassUnit.Status, or to it exactly) could not be held
+		// down for the flight, so it would walk and attack in the air: it stands its ground instead.
+		const FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(Handle);
+		if (!bDead && Ability && UE::MassUnitSystem::Tags::StatusLaunched().MatchesAny(Ability->StatusImmunityTags))
+		{
+			return false;
+		}
+		Velocity = (Velocity * Scale).GetClampedToMaxSize(Settings->MaxLaunchSpeed);
+	}
+
+	FActiveLaunch* Launch = ActiveLaunches.Find(Handle);
+	if (!Launch)
+	{
+		if (ActiveLaunches.Num() >= Settings->MaxAirborneUnits)
+		{
+			return false;   // bounded cost: a screen-clearing blast past the cap damages in place
+		}
+		Launch = &ActiveLaunches.Add(Handle);
+	}
+
+	const float Gravity = Settings->LaunchGravity;
+	FTransform& UnitTransform = Transform->GetMutableTransform();
+	Launch->Velocity = Velocity;
+	Launch->FlightTime = 0.0f;
+	Launch->Bounces = 0;
+	Launch->bSettling = false;
+	Launch->bDead = bDead;
+	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity);
+
+	if (bDead)
+	{
+		StartCorpseTumble(*Launch, Handle);
+		PendingRagdollRequests.Emplace(UnitHandle.EntityHandle, Velocity);
+	}
+	else
+	{
+		// Thrown backwards: face where the hit came from, and stay down through the flight and the knockdown.
+		const FVector Back = -Velocity.GetSafeNormal2D();
+		if (!Back.IsNearlyZero())
+		{
+			UnitTransform.SetRotation(FQuat(FRotator(0.0f, Back.Rotation().Yaw, 0.0f)));
+		}
+		// Held down for the WHOLE flight, however long it really takes (slow server frames, a long fall off a ledge):
+		// the landing replaces this with the knockdown, and TickLaunches re-arms it if anything lifts it mid-air.
+		FMassUnitStatusEffect Down;
+		Down.StatusTag = UE::MassUnitSystem::Tags::StatusLaunched();
+		Down.Duration = LaunchFlightHoldSeconds;
+		Down.bStuns = true;
+		Down.MoveSpeedMultiplier = 0.0f;
+		ApplyUnitStatus(UnitHandle, Down, LaunchInstigator);
+	}
+
+	OnUnitLaunched.Broadcast(UnitHandle, Velocity, bDead);
+	return true;
+}
+
+bool UMassUnitEntityManager::IsUnitAirborne(FMassUnitHandle UnitHandle) const
+{
+	return UnitHandle.IsValid() && ActiveLaunches.Contains(UnitHandle.EntityHandle.ToMassEntityHandle());
+}
+
+TArray<TPair<FMassUnitEntityHandle, FVector>> UMassUnitEntityManager::ConsumeRagdollRequests()
+{
+	return MoveTemp(PendingRagdollRequests);
+}
+
+float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity) const
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	if (!World || !Settings || !Settings->bTraceLandingGround)
+	{
+		return Start.Z;
+	}
+	// Per-frame budget: a screen-clearing blast must not stall the frame on hundreds of synchronous traces. Past the
+	// budget a unit lands at its launch height, which is right on flat ground.
+	const uint64 Frame = GFrameCounter;
+	if (Frame != LandingTraceFrame)
+	{
+		LandingTraceFrame = Frame;
+		LandingTracesThisFrame = 0;
+	}
+	if (LandingTracesThisFrame >= Settings->MaxLandingTracesPerFrame)
+	{
+		return Start.Z;
+	}
+	++LandingTracesThisFrame;
+	// One trace per launch, where the arc returns to launch height: a unit knocked off a ledge lands below it.
+	const float FlightTime = Velocity.Z > 0.0f ? 2.0f * Velocity.Z / Gravity : 0.25f;
+	const FVector Landing = Start + FVector(Velocity.X, Velocity.Y, 0.0f) * FlightTime;
+	FHitResult Hit;
+	const FCollisionObjectQueryParams StaticWorld(ECC_WorldStatic);
+	if (World->LineTraceSingleByObjectType(Hit, Landing + FVector(0.0f, 0.0f, 200.0f), Landing - FVector(0.0f, 0.0f, 1500.0f),
+		StaticWorld, FCollisionQueryParams(SCENE_QUERY_STAT(MassUnitLaunchLanding), false)))
+	{
+		return Hit.ImpactPoint.Z;
+	}
+	return Start.Z;
+}
+
+void UMassUnitEntityManager::StartCorpseTumble(FActiveLaunch& Launch, const FMassEntityHandle& Handle) const
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	const float Rate = Settings ? Settings->CorpseTumbleDegreesPerSecond : 540.0f;
+	// Deterministic per entity (a corpse always tumbles the same way on this machine; client puppets have their own
+	// entity indices, so their spin differs slightly from the server's): mostly a back-flip, a little roll.
+	const float SeedA = FMath::Frac(static_cast<float>(Handle.Index) * 0.6180339887f);
+	const float SeedB = FMath::Frac(static_cast<float>(Handle.Index) * 0.7548776662f);
+	Launch.PitchRate = Rate * (0.6f + 0.4f * SeedA);
+	Launch.RollRate = Rate * 0.35f * (SeedB * 2.0f - 1.0f);
+}
+
+void UMassUnitEntityManager::TickLaunches(float DeltaTime)
+{
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_TickLaunches);
+	if (ActiveLaunches.IsEmpty() || !EntitySubsystem)
+	{
+		return;
+	}
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	const float Gravity = Settings ? Settings->LaunchGravity : 1960.0f;
+	const float Restitution = Settings ? Settings->CorpseBounceRestitution : 0.3f;
+	const float Knockdown = Settings ? Settings->KnockdownSeconds : 0.8f;
+	const float Dt = FMath::Min(DeltaTime, 0.05f);
+	constexpr float SettleSeconds = 0.2f;
+	constexpr float MaxFlightSeconds = 6.0f;
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+
+	for (auto It = ActiveLaunches.CreateIterator(); It; ++It)
+	{
+		const FMassEntityHandle Handle = It->Key;
+		FActiveLaunch& Launch = It->Value;
+		FMassUnitTransformFragment* Transform = EntityManager.IsEntityValid(Handle)
+			? EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle) : nullptr;
+		const FMassUnitStateFragment* State = Transform ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle) : nullptr;
+		if (!Transform || !State)
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		FTransform& UnitTransform = Transform->GetMutableTransform();
+
+		// Killed in mid-air (a juggle finisher): from here it flies as a corpse.
+		if (!Launch.bDead && State->CurrentState == EMassUnitState::Dead)
+		{
+			Launch.bDead = true;
+			StartCorpseTumble(Launch, Handle);
+			PendingRagdollRequests.Emplace(FMassUnitEntityHandle(Handle), Launch.Velocity);
+			OnUnitLaunched.Broadcast(FMassUnitHandle(FMassUnitEntityHandle(Handle)), Launch.Velocity, true);
+		}
+
+		// A living unit must stay stunned for its whole flight; a cleanse or an expiry mid-air re-arms the hold, or the
+		// movement and combat processors would walk and attack it in the air.
+		if (!Launch.bDead && State->CurrentState != EMassUnitState::Stunned)
+		{
+			FMassUnitStatusEffect Hold;
+			Hold.StatusTag = UE::MassUnitSystem::Tags::StatusLaunched();
+			Hold.Duration = LaunchFlightHoldSeconds;
+			Hold.bStuns = true;
+			Hold.MoveSpeedMultiplier = 0.0f;
+			ApplyUnitStatus(FMassUnitHandle(FMassUnitEntityHandle(Handle)), Hold);
+		}
+
+		if (Launch.bSettling)
+		{
+			// The corpse rolls flat onto the ground (yaw only), where the held death pose lies.
+			Launch.SettleTime += Dt;
+			const float Alpha = FMath::Clamp(Launch.SettleTime / SettleSeconds, 0.0f, 1.0f);
+			UnitTransform.SetRotation(FQuat::Slerp(Launch.SettleFrom, FQuat(FRotator(0.0f, Launch.Yaw, 0.0f)), Alpha).GetNormalized());
+			if (Alpha >= 1.0f)
+			{
+				It.RemoveCurrent();
+			}
+			continue;
+		}
+
+		Launch.FlightTime += Dt;
+		Launch.Velocity.Z -= Gravity * Dt;
+		FVector Location = UnitTransform.GetLocation() + Launch.Velocity * Dt;
+		if (Launch.bDead)
+		{
+			const FQuat Spin(FRotator(-Launch.PitchRate * Dt, 0.0f, Launch.RollRate * Dt));
+			UnitTransform.SetRotation((UnitTransform.GetRotation() * Spin).GetNormalized());
+		}
+
+		const bool bTouchedDown = Location.Z <= Launch.LandZ && Launch.Velocity.Z < 0.0f;
+		if (!bTouchedDown && Launch.FlightTime < MaxFlightSeconds)
+		{
+			UnitTransform.SetLocation(Location);
+			continue;
+		}
+
+		Location.Z = Launch.LandZ;
+		UnitTransform.SetLocation(Location);
+		if (Launch.bDead && Launch.Bounces == 0 && Restitution > 0.0f && -Launch.Velocity.Z > 250.0f)
+		{
+			// One bounce sells the weight; more reads as rubber.
+			Launch.Velocity = FVector(Launch.Velocity.X * 0.5f, Launch.Velocity.Y * 0.5f, -Launch.Velocity.Z * Restitution);
+			Launch.PitchRate *= 0.5f;
+			Launch.RollRate *= 0.5f;
+			++Launch.Bounces;
+			continue;
+		}
+
+		const FMassUnitHandle Unit{FMassUnitEntityHandle(Handle)};
+		OnUnitLanded.Broadcast(Unit, Location, Launch.bDead);
+		if (Launch.bDead)
+		{
+			Launch.bSettling = true;
+			Launch.SettleTime = 0.0f;
+			Launch.SettleFrom = UnitTransform.GetRotation();
+			Launch.Yaw = UnitTransform.Rotator().Yaw;
+			continue;
+		}
+
+		// A living unit lands upright and stays down for exactly the knockdown: the flight hold is removed first,
+		// because a refresh never shortens a status.
+		UnitTransform.SetRotation(FQuat(FRotator(0.0f, UnitTransform.Rotator().Yaw, 0.0f)));
+		It.RemoveCurrent();
+		RemoveUnitStatus(Unit, UE::MassUnitSystem::Tags::StatusLaunched());
+		FMassUnitStatusEffect Down;
+		Down.StatusTag = UE::MassUnitSystem::Tags::StatusLaunched();
+		Down.Duration = Knockdown;
+		Down.bStuns = true;
+		Down.MoveSpeedMultiplier = 0.0f;
+		ApplyUnitStatus(Unit, Down);
+	}
 }

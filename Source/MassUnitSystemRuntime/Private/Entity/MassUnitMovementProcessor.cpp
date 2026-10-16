@@ -1,6 +1,7 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Entity/MassUnitMovementProcessor.h"
+#include "Core/MassUnitStats.h"
 
 #include "Core/MassUnitGameplayTags.h"
 #include "Entity/MassUnitFragments.h"
@@ -33,8 +34,11 @@ void UMassUnitMovementProcessor::ConfigureQueries(const TSharedRef<FMassEntityMa
 		EMassFragmentPresence::Optional);
 }
 
+DECLARE_CYCLE_STAT(TEXT("Movement Processor"), STAT_MassUnit_MovementProcessor, STATGROUP_MassUnitSystem);
+
 void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMassExecutionContext& Context)
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_MovementProcessor);
 	const float DeltaTime = FMath::Min(Context.GetDeltaTimeSeconds(), 0.1f);
 	EntityQuery.ForEachEntityChunk(Context, [this, &EntityManager, DeltaTime](FMassExecutionContext& ChunkContext)
 	{
@@ -154,7 +158,8 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 							? (DesiredDirection + Crowd->SteeringDirection).GetSafeNormal()
 							: (DesiredDirection + Crowd->SteeringDirection).GetSafeNormal2D();
 					}
-					DesiredVelocity = DesiredDirection * State.MoveSpeed;
+					// Status slows (chill, tar) and roots multiply in here; 1 when the unit has none.
+					DesiredVelocity = DesiredDirection * State.MoveSpeed * FMath::Max(0.0f, State.StatusMoveSpeedMultiplier);
 				}
 			}
 
@@ -180,7 +185,11 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 						State.StateTime = 0.0f;
 					}
 					State.CurrentState = EMassUnitState::Moving;
-					Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationWalk();
+					const bool bRunning = Visual.RunSpeedThreshold > 0.0f
+						&& Velocity.Value.SizeSquared2D() >= FMath::Square(Visual.RunSpeedThreshold);
+					Visual.CurrentAnimation = bRunning
+						? UE::MassUnitSystem::Tags::AnimationRun()
+						: UE::MassUnitSystem::Tags::AnimationWalk();
 				}
 			}
 			else if (State.CurrentState == EMassUnitState::Moving)

@@ -14,6 +14,7 @@ class USkeletalMesh;
 class UStaticMesh;
 class UTexture2D;
 class UAnimationAsset;
+class AActor;
 
 UENUM(BlueprintType)
 enum class EMassUnitState : uint8
@@ -84,6 +85,108 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitStateFragment : public FMassFragment
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Movement", meta = (ClampMin = "0.0", ForceUnits = "cm/s"))
 	float MoveSpeed = 300.0f;
+
+	/**
+	 * Delay from the start of a swing to the moment its damage lands, copied from the template.
+	 * Zero applies damage on the frame the swing starts, which was the only behaviour before this field.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Combat", meta = (ClampMin = "0.0", ForceUnits = "s"))
+	float AttackImpactDelay = 0.0f;
+
+	/** Increments once per swing. Presentation restarts the attack clip whenever it changes. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Combat")
+	int32 AttackSerial = 0;
+
+	/** Damage of a swing whose impact frame has not been reached yet; zero when nothing is pending. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Combat")
+	float PendingAttackDamage = 0.0f;
+
+	/** Product of every active status slow. 1 is normal speed, 0 is rooted. Applied by the movement processor. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	float StatusMoveSpeedMultiplier = 1.0f;
+
+	/** Presentation-only units (client puppets): last replicated swing counter seen, see ApplyPresentationState. */
+	uint8 PresentationSwingCounter = 0;
+
+	/** Starts a swing: restarts the attack clip and records the damage to land at the impact delay. */
+	void BeginAttackSwing(float Damage)
+	{
+		StateTime = 0.0f;
+		++AttackSerial;
+		PendingAttackDamage = FMath::Max(0.0f, Damage);
+	}
+
+	/** Returns the pending swing damage once its impact time is reached, clearing it; otherwise zero. */
+	float ConsumeAttackImpact()
+	{
+		if (PendingAttackDamage <= 0.0f || StateTime + UE_KINDA_SMALL_NUMBER < AttackImpactDelay)
+		{
+			return 0.0f;
+		}
+		const float Damage = PendingAttackDamage;
+		PendingAttackDamage = 0.0f;
+		return Damage;
+	}
+};
+
+/**
+ * One timed status on a unit, the crowd-side stand-in for an active Gameplay Effect.
+ * Tag-driven: anything that grants Status.Burning to an actor can grant it to a unit here.
+ */
+USTRUCT(BlueprintType)
+struct MASSUNITSYSTEMRUNTIME_API FMassUnitStatusEffect
+{
+	GENERATED_BODY()
+
+	/** Tag granted while the status is active, for example Status.Burning or Status.Stunned. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status")
+	FGameplayTag StatusTag;
+
+	/** Seconds the status lasts. Zero or less makes it permanent until removed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status", meta = (ForceUnits = "s"))
+	float Duration = 0.0f;
+
+	/** Damage reported each period through OnUnitStatusDamageTick. Zero for non-damaging statuses. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status", meta = (ClampMin = "0.0"))
+	float DamagePerPeriod = 0.0f;
+
+	/** Damage type reported with each tick (e.g. Damage.Thermal for a burn), so the project can colour and resist it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status")
+	FGameplayTag DamageTypeTag;
+
+	/** Seconds between damage ticks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status", meta = (ClampMin = "0.05", ForceUnits = "s"))
+	float Period = 1.0f;
+
+	/** Movement multiplier while active. 1 leaves speed alone, 0 roots the unit. Multiplies with other statuses. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float MoveSpeedMultiplier = 1.0f;
+
+	/** Puts the unit in the Stunned state for the duration: no movement, no attacks, stun animation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status")
+	bool bStuns = false;
+
+	/** Re-applying the same tag refreshes the timer; with this set it also adds a stack (damage scales by stacks). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status")
+	bool bStacks = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Status", meta = (ClampMin = "1"))
+	int32 MaxStacks = 1;
+
+	/** Who applied it. Damage ticks are credited to this actor. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	TWeakObjectPtr<AActor> Instigator;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	int32 Stacks = 1;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	float ExpireTime = 0.0f;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	float NextTickTime = 0.0f;
+
+	bool IsPermanent() const { return Duration <= 0.0f; }
 };
 
 USTRUCT(BlueprintType)
@@ -121,6 +224,33 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitAbilityFragment : public FMassFragment
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit")
 	TArray<FGameplayTag> DefaultAbilityTags;
+
+	/**
+	 * Every gameplay tag the unit currently carries: the template's identity tags plus loose tags plus
+	 * the tags of active timed statuses. This is what tag queries read; rebuild it with RebuildTags().
+	 */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Tags")
+	FGameplayTagContainer OwnedTags;
+
+	/** Tags set from the template or by gameplay with no duration. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Tags")
+	FGameplayTagContainer LooseTags;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	TArray<FMassUnitStatusEffect> ActiveStatuses;
+
+	/** Statuses this unit refuses, copied from the template. Matched hierarchically. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
+	FGameplayTagContainer StatusImmunityTags;
+
+	void RebuildTags()
+	{
+		OwnedTags = LooseTags;
+		for (const FMassUnitStatusEffect& Status : ActiveStatuses)
+		{
+			OwnedTags.AddTag(Status.StatusTag);
+		}
+	}
 };
 
 USTRUCT(BlueprintType)
@@ -200,6 +330,19 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitVisualFragment : public FMassFragment
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit")
 	TArray<FGameplayTag> AnimationTags;
+
+	/** Template the unit was built from. Supplies the vertex-animation clip table to the renderer. */
+	TWeakObjectPtr<const class UUnitTemplate> SourceTemplate;
+
+	/** Speed above which the move clip switches from Walk to Run. Zero never uses Run. */
+	float RunSpeedThreshold = 0.0f;
+
+	/**
+	 * Deterministic 0-1 seed for everything random about how this unit LOOKS (animation phase today; variant parts,
+	 * tint and scale jitter later). Set at spawn from the entity index (the value the renderer always used) and
+	 * overwritten on client puppets with the server's value, so every machine draws the same unit. Negative = unset.
+	 */
+	float VariantSeed = -1.0f;
 };
 
 USTRUCT(BlueprintType)

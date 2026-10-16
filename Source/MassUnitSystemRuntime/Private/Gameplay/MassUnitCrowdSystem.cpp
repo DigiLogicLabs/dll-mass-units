@@ -1,12 +1,15 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Gameplay/MassUnitCrowdSystem.h"
+#include "Core/MassUnitStats.h"
 
 #include "AbilitySystemBlueprintLibrary.h"
 #include "AbilitySystemComponent.h"
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
+#include "Core/MassUnitSystemRuntime.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Entity/MassUnitFragments.h"
 #include "GameFramework/Actor.h"
@@ -67,6 +70,7 @@ void UMassUnitCrowdSystem::Deinitialize()
 
 	Groups.Reset();
 	UnitToGroup.Reset();
+	PendingSignals.Reset();
 	LastStats = {};
 	NavigationSystem = nullptr;
 	UnitManager = nullptr;
@@ -398,6 +402,33 @@ bool UMassUnitCrowdSystem::ActivateCrowdGroupForActor(int32 CrowdGroupHandle, AA
 		}
 	}
 
+	if (!bWasEngaged && Group->bCollectiveEnabled)
+	{
+		// Consume the relay depth the activation path left for us (zero for direct activations) and
+		// tell nearby groups. The rebroadcast timer reuses the depth so repeats stay as damped as the
+		// first emission and a relay chain cannot re-amplify itself.
+		const int32 RelayDepth = Group->PendingAlertRelayDepth;
+		Group->PendingAlertRelayDepth = 0;
+		Group->EngagementRelayDepth = RelayDepth;
+		Group->Awareness = 0.0f;
+		Group->PendingAlertActivationTime = -1.0f;
+		Group->PendingAlertTarget.Reset();
+		const FMassUnitCrowdCollectiveConfig& Collective = Group->CollectiveConfig;
+		if (Collective.bBroadcastAlerts && RelayDepth <= Collective.MaxAlertRelayDepth)
+		{
+			EmitCrowdSignal(
+				*Group,
+				ECrowdSignalType::Alert,
+				Collective.AlertRadius,
+				Collective.AlertStrength * FMath::Pow(Collective.AlertRelayFalloff, static_cast<float>(RelayDepth)),
+				TargetActor,
+				RelayDepth);
+		}
+		Group->NextAlertBroadcastTime = World->GetTimeSeconds() + Collective.AlertRebroadcastInterval;
+		// The activating target gets the switch grace period, so a bystander cannot steal the group instantly.
+		Group->LastTargetSwitchTime = World->GetTimeSeconds();
+	}
+
 	if (!bWasEngaged)
 	{
 		RequestPresentationCue(*Group, EMassUnitCrowdCue::EngagementStarted, CalculateGroupAnchor(*Group));
@@ -566,8 +597,13 @@ void UMassUnitCrowdSystem::StopTimerIfIdle()
 	}
 }
 
+DECLARE_CYCLE_STAT(TEXT("Crowd Update"), STAT_MassUnit_CrowdUpdate, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Crowd Engagements"), STAT_MassUnit_CrowdEngagements, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Crowd Collective Behavior"), STAT_MassUnit_CrowdCollective, STATGROUP_MassUnitSystem);
+
 void UMassUnitCrowdSystem::UpdateCrowds()
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_CrowdUpdate);
 	if (!World || !EntitySubsystem || !UnitManager || bUpdatingCrowds)
 	{
 		return;
@@ -615,6 +651,7 @@ void UMassUnitCrowdSystem::UpdateCrowds()
 	UpdateCursor = (StartIndex + UnitsToUpdate) % Entries.Num();
 	PruneInvalidUnits();
 	RefreshPopulationStats(Entries);
+	DrawCollectiveDebug(CurrentTime);
 }
 
 void UMassUnitCrowdSystem::PruneInvalidUnits()
@@ -717,9 +754,14 @@ void UMassUnitCrowdSystem::RefreshPopulationStats(const TArray<FSpatialEntry>& E
 	LastStats.EngagedUnits = 0;
 	LastStats.ActiveAttackers = 0;
 	LastStats.UnitsAwaitingAttackToken = 0;
+	LastStats.RoutingGroups = 0;
 	for (const TPair<int32, FCrowdGroup>& Pair : Groups)
 	{
 		LastStats.ManagedSubgroups += Pair.Value.SubgroupCount;
+		if (Pair.Value.bCollectiveEnabled && Pair.Value.bRouting)
+		{
+			++LastStats.RoutingGroups;
+		}
 		if (Pair.Value.bEngaged && Pair.Value.TargetActor.IsValid())
 		{
 			++LastStats.EngagedGroups;
@@ -1041,6 +1083,12 @@ void UMassUnitCrowdSystem::UpdateUnit(
 		{
 			Crowd->SteeringDirection = CalculateSeparation(Entry, Group, Entries, Cells);
 			Crowd->NextSteeringUpdateTime = CurrentTime + (UpdateInterval * LODMultiplier);
+		}
+		// A routed group's units keep fighting until the staggered rout reaches them, then flee.
+		if (Group.bCollectiveEnabled && Group.bRouting && HasRoutReachedUnit(Entry.Entity, Group, CurrentTime))
+		{
+			UpdateRoutingUnit(Entry, Group, CurrentTime, bForceDecision);
+			return;
 		}
 		UpdateEngagedUnit(Entry, Group, CurrentTime, bForceDecision);
 		return;
@@ -1519,6 +1567,7 @@ void UMassUnitCrowdSystem::RemoveUnitFromPreviousGroup(FMassUnitEntityHandle Ent
 
 void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_CrowdEngagements);
 	// Expire tokens once per update for every group. Acquisition also prunes, but that only happens
 	// while somebody is in range; without this pass a group whose units all withdrew would keep
 	// reporting its last holders through ActiveAttackers forever.
@@ -1529,6 +1578,10 @@ void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 			PruneAttackTokens(Pair.Value, CurrentTime);
 		}
 	}
+
+	// Collective behavior runs first so a threat-table retarget can rescue an engagement whose target
+	// just became invalid, and so recruitment decided this update is visible to the pass below.
+	UpdateCollectiveBehavior(CurrentTime);
 
 	TArray<int32> GroupHandles;
 	Groups.GetKeys(GroupHandles);
@@ -1543,7 +1596,10 @@ void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 		if (Group->bEngaged)
 		{
 			AActor* TargetActor = Group->TargetActor.Get();
-			if (!IsValid(TargetActor))
+			// A target the project's hostility rule now rejects (recruited, team swapped) is dropped like a
+			// destroyed one. With collective threat the lost-target rescue then picks the next hostile actor.
+			if (!IsValid(TargetActor)
+				|| (TargetFilter.IsBound() && !PassesTargetFilter(TargetActor, Group->bCollectiveEnabled ? Group->TeamID : ResolveGroupTeamID(*Group))))
 			{
 				const bool bReturnToWander = Group->EngagementConfig.bReturnToWanderOnDeactivate;
 				DeactivateCrowdGroupEngagement(GroupHandle, bReturnToWander);
@@ -1588,14 +1644,20 @@ void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 			continue;
 		}
 
+		// A routed group does not re-acquire players on its own until it rallies.
+		if (Group->bCollectiveEnabled && Group->bRouting)
+		{
+			continue;
+		}
+
 		AActor* AutomaticTarget = nullptr;
 		switch (Group->EngagementConfig.ActivationMode)
 		{
 		case EMassUnitCrowdActivationMode::OnPlayerProximity:
-			AutomaticTarget = FindClosestPlayerTarget(Group->Center, Group->EngagementConfig.ActivationRadius);
+			AutomaticTarget = FindClosestPlayerTarget(Group->Center, Group->EngagementConfig.ActivationRadius, TargetFilter.IsBound() ? ResolveGroupTeamID(*Group) : INDEX_NONE);
 			break;
 		case EMassUnitCrowdActivationMode::Always:
-			AutomaticTarget = FindClosestPlayerTarget(Group->Center, 0.0f);
+			AutomaticTarget = FindClosestPlayerTarget(Group->Center, 0.0f, TargetFilter.IsBound() ? ResolveGroupTeamID(*Group) : INDEX_NONE);
 			break;
 		default:
 			break;
@@ -1690,17 +1752,28 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 			State->StateTime = 0.0f;
 		}
 		Visual->CurrentAnimation = UE::MassUnitSystem::Tags::AnimationAttack();
-		if (State->AttackCooldownRemaining <= 0.0f)
+		if (State->AttackCooldownRemaining <= 0.0f && State->PendingAttackDamage <= 0.0f)
 		{
-			const float Damage = State->BaseDamage
+			// Each swing restarts the attack clip (new start stamp and AttackSerial) and lands its damage
+			// at the template's AttackImpactDelay. With a zero delay the consume below fires this same
+			// update, which is exactly the behaviour from before the delay existed.
+			State->BeginAttackSwing(State->BaseDamage
 				* static_cast<float>(FMath::Max(1, State->UnitLevel))
-				* Group.EngagementConfig.DamageMultiplier;
+				* Group.EngagementConfig.DamageMultiplier);
 			State->AttackCooldownRemaining = FMath::Max(UpdateInterval, State->AttackCooldown);
-			RequestActorAttack(Entry.Entity, Group, TargetActor, Damage);
+		}
+		// Engaged units are revisited round-robin, so a non-zero impact lands on the first visit after
+		// the delay elapses rather than on the exact frame.
+		const float ImpactDamage = State->ConsumeAttackImpact();
+		if (ImpactDamage > 0.0f)
+		{
+			RequestActorAttack(Entry.Entity, Group, TargetActor, ImpactDamage);
 		}
 		return true;
 	}
 
+	// Out of range or out of a token before the impact frame: the swing whiffs.
+	State->PendingAttackDamage = 0.0f;
 	if (State->CurrentState == EMassUnitState::Attacking)
 	{
 		State->CurrentState = EMassUnitState::Idle;
@@ -2109,7 +2182,12 @@ void UMassUnitCrowdSystem::RequestPresentationCue(
 	OnCrowdCueRequested.Broadcast(Group.Handle, SubgroupIndex, Cue, WorldLocation);
 }
 
-AActor* UMassUnitCrowdSystem::FindClosestPlayerTarget(const FVector& Origin, float MaxDistance) const
+bool UMassUnitCrowdSystem::PassesTargetFilter(const AActor* Candidate, int32 CrowdTeamID) const
+{
+	return !TargetFilter.IsBound() || TargetFilter.Execute(Candidate, CrowdTeamID);
+}
+
+AActor* UMassUnitCrowdSystem::FindClosestPlayerTarget(const FVector& Origin, float MaxDistance, int32 CrowdTeamID) const
 {
 	if (!World)
 	{
@@ -2124,7 +2202,7 @@ AActor* UMassUnitCrowdSystem::FindClosestPlayerTarget(const FVector& Origin, flo
 	{
 		const APlayerController* Controller = It->Get();
 		APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
-		if (!IsValid(Pawn))
+		if (!IsValid(Pawn) || !PassesTargetFilter(Pawn, CrowdTeamID))
 		{
 			continue;
 		}
@@ -2346,6 +2424,986 @@ FMassUnitPlayerEngagementConfig UMassUnitCrowdSystem::SanitizeEngagementConfig(
 	// Below 1.0 the standoff ring would sit inside attack range, so token-less units would attack anyway.
 	Result.StandoffDistanceMultiplier = FMath::Clamp(Result.StandoffDistanceMultiplier, 1.05f, 4.0f);
 	Result.EngagementSlotCount = FMath::Clamp(Result.EngagementSlotCount, 3, 64);
+	return Result;
+}
+
+// ============================================================================
+// COLLECTIVE BEHAVIOR - alerts, morale/rout, threat targeting
+// ============================================================================
+// Everything below is GROUP-level and runs once per crowd update (UpdateGroupEngagements),
+// so its cost scales with the number of groups and signals, not units. The only O(group size)
+// work - counting living units and finding the anchor - is throttled by MoraleEvaluationInterval
+// and its result cached for the signal and threat passes. Groups that never call
+// ConfigureCrowdGroupCollectiveBehavior skip every branch here.
+// ============================================================================
+
+bool UMassUnitCrowdSystem::ConfigureCrowdGroupCollectiveBehavior(
+	int32 CrowdGroupHandle,
+	const FMassUnitCrowdCollectiveConfig& Config,
+	bool bEnableCollectiveBehavior)
+{
+	FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group)
+	{
+		return false;
+	}
+	const float CurrentTime = World ? World->GetTimeSeconds() : 0.0f;
+
+	// Disabling mid-rout must not leave units at flee speed with stale flee destinations.
+	if (!bEnableCollectiveBehavior && Group->bCollectiveEnabled && Group->bRouting)
+	{
+		EndRout(*Group, CurrentTime);
+		Group = Groups.Find(CrowdGroupHandle);
+		if (!Group)
+		{
+			return false;
+		}
+	}
+
+	Group->CollectiveConfig = SanitizeCollectiveConfig(Config);
+	Group->bCollectiveEnabled = bEnableCollectiveBehavior;
+	Group->TeamID = ResolveGroupTeamID(*Group);
+	Group->Awareness = 0.0f;
+	Group->PendingAlertActivationTime = -1.0f;
+	Group->PendingAlertTarget.Reset();
+	Group->PendingAlertSourceGroup = INDEX_NONE;
+	Group->PendingRecruitRelayDepth = 0;
+	Group->PendingAlertRelayDepth = 0;
+	Group->LastCollectiveUpdateTime = CurrentTime;
+	Group->NextMoraleEvaluationTime = 0.0f;
+
+	FVector Anchor = Group->Center;
+	const int32 LivingCount = CountLivingUnits(*Group, &Anchor);
+	Group->CachedAnchor = Anchor;
+	Group->bHasCachedAnchor = LivingCount > 0;
+	// Reconfiguring keeps the casualty baseline so tuning a live group does not "forgive" its dead.
+	Group->InitialLivingCount = FMath::Max(Group->InitialLivingCount, LivingCount);
+	Group->LastLivingCount = LivingCount;
+
+	if (!bEnableCollectiveBehavior)
+	{
+		Group->Morale = 1.0f;
+		Group->bRouting = false;
+		Group->Threat.Reset();
+	}
+	return true;
+}
+
+bool UMassUnitCrowdSystem::ReportCrowdUnitDamaged(
+	FMassUnitHandle UnitHandle,
+	float Damage,
+	AActor* DamageInstigator)
+{
+	if (!World || World->GetNetMode() == NM_Client || !IsEntityValid(UnitHandle.EntityHandle))
+	{
+		return false;
+	}
+	const int32* FoundGroupHandle = UnitToGroup.Find(UnitHandle.EntityHandle);
+	if (!FoundGroupHandle)
+	{
+		return false;
+	}
+	const int32 GroupHandle = *FoundGroupHandle;
+	FCrowdGroup* Group = Groups.Find(GroupHandle);
+	AActor* Instigator = ResolveThreatActor(DamageInstigator);
+	if (!Group || !Instigator)
+	{
+		return false;
+	}
+	// Friendly fire (by the project's rules) neither builds threat nor turns the crowd.
+	if (TargetFilter.IsBound() && !PassesTargetFilter(Instigator, Group->bCollectiveEnabled ? Group->TeamID : ResolveGroupTeamID(*Group)))
+	{
+		return false;
+	}
+
+	if (Group->bCollectiveEnabled && Group->CollectiveConfig.bEnableThreatTargeting && Damage > 0.0f)
+	{
+		Group->Threat.FindOrAdd(TWeakObjectPtr<AActor>(Instigator)) += Damage * Group->CollectiveConfig.DamageThreatScale;
+	}
+
+	// An engaged group never jumps targets per hit; the threat table (collective) decides that with
+	// hysteresis, and without collective behavior the original target is kept exactly as before.
+	if (Group->bEngaged)
+	{
+		return true;
+	}
+	if (!Group->bEngagementEnabled || Group->bPaused || (Group->bCollectiveEnabled && Group->bRouting))
+	{
+		return false;
+	}
+	const bool bActivationAllowed =
+		Group->EngagementConfig.ActivationMode == EMassUnitCrowdActivationMode::OnInteraction
+		|| (Group->bCollectiveEnabled && Group->CollectiveConfig.bActivateOnDamage);
+	if (!bActivationAllowed)
+	{
+		return false;
+	}
+	// A hit is a direct activation: discard any relay depth a pending recruitment left behind.
+	Group->PendingAlertRelayDepth = 0;
+	return ActivateCrowdGroupForActor(GroupHandle, Instigator);
+}
+
+bool UMassUnitCrowdSystem::ApplyCrowdGroupMoraleShock(int32 CrowdGroupHandle, float MoraleLoss)
+{
+	FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group || !Group->bCollectiveEnabled || !Group->CollectiveConfig.bEnableMorale)
+	{
+		return false;
+	}
+	Group->Morale = FMath::Clamp(Group->Morale - MoraleLoss, 0.0f, 1.0f);
+	return true;
+}
+
+bool UMassUnitCrowdSystem::RaiseCrowdAlertAtLocation(
+	FVector WorldLocation,
+	float Radius,
+	float Strength,
+	AActor* TargetActor,
+	int32 TeamID)
+{
+	if (!World || World->GetNetMode() == NM_Client || Radius <= 0.0f || Strength <= 0.0f)
+	{
+		return false;
+	}
+	FCrowdSignal Signal;
+	Signal.Type = ECrowdSignalType::Alert;
+	Signal.SourceGroup = INDEX_NONE;
+	Signal.TeamID = TeamID >= 0 ? TeamID : INDEX_NONE;
+	Signal.Location = WorldLocation;
+	Signal.Radius = Radius;
+	Signal.Strength = Strength;
+	Signal.Target = ResolveThreatActor(TargetActor);
+	Signal.RelayDepth = 0;
+	const int32 PreviousCount = PendingSignals.Num();
+	QueueCrowdSignal(Signal);
+	return PendingSignals.Num() > PreviousCount;
+}
+
+float UMassUnitCrowdSystem::GetCrowdGroupMorale(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	return Group && Group->bCollectiveEnabled && Group->CollectiveConfig.bEnableMorale ? Group->Morale : 1.0f;
+}
+
+bool UMassUnitCrowdSystem::IsCrowdGroupRouting(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	return Group && Group->bCollectiveEnabled && Group->bRouting;
+}
+
+float UMassUnitCrowdSystem::GetCrowdGroupAwareness(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	return Group && Group->bCollectiveEnabled ? Group->Awareness : 0.0f;
+}
+
+bool UMassUnitCrowdSystem::GetCrowdGroupAnchor(int32 CrowdGroupHandle, FVector& OutLocation) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group)
+	{
+		return false;
+	}
+	OutLocation = GetCollectiveAnchor(*Group);
+	return true;
+}
+
+int32 UMassUnitCrowdSystem::GetCrowdGroupTeamID(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group)
+	{
+		return INDEX_NONE;
+	}
+	return Group->bCollectiveEnabled && Group->TeamID >= 0 ? Group->TeamID : ResolveGroupTeamID(*Group);
+}
+
+int32 UMassUnitCrowdSystem::GetUnitCrowdGroup(FMassUnitHandle UnitHandle) const
+{
+	const int32* GroupHandle = UnitToGroup.Find(UnitHandle.EntityHandle);
+	return GroupHandle ? *GroupHandle : INDEX_NONE;
+}
+
+void UMassUnitCrowdSystem::UpdateCollectiveBehavior(float CurrentTime)
+{
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_CrowdCollective);
+	// Crowd decisions are server-authoritative; clients only ever see the resulting unit state.
+	if (!World || World->GetNetMode() == NM_Client)
+	{
+		PendingSignals.Reset();
+		return;
+	}
+
+	TArray<int32> GroupHandles;
+	Groups.GetKeys(GroupHandles);
+
+	// ---- Per-group bookkeeping: decay, morale, threat, periodic alert rebroadcast.
+	for (const int32 GroupHandle : GroupHandles)
+	{
+		FCrowdGroup* Group = Groups.Find(GroupHandle);
+		if (!Group || !Group->bCollectiveEnabled)
+		{
+			continue;
+		}
+		const float DeltaTime = Group->LastCollectiveUpdateTime >= 0.0f
+			? FMath::Max(0.0f, CurrentTime - Group->LastCollectiveUpdateTime)
+			: 0.0f;
+		Group->LastCollectiveUpdateTime = CurrentTime;
+		if (Group->bPaused)
+		{
+			continue;
+		}
+
+		// Sub-threshold awareness fades; a recruitment already scheduled is not cancelled by decay.
+		if (Group->PendingAlertActivationTime < 0.0f)
+		{
+			Group->Awareness = FMath::Max(0.0f, Group->Awareness - Group->CollectiveConfig.AwarenessDecayPerSecond * DeltaTime);
+		}
+
+		// The throttled O(group size) pass. Runs even with morale off, because signals and threat
+		// read the cached anchor it produces.
+		if (CurrentTime >= Group->NextMoraleEvaluationTime)
+		{
+			Group->NextMoraleEvaluationTime = CurrentTime + Group->CollectiveConfig.MoraleEvaluationInterval;
+			FVector Anchor = Group->Center;
+			const int32 LivingCount = CountLivingUnits(*Group, &Anchor);
+			Group->CachedAnchor = Anchor;
+			Group->bHasCachedAnchor = LivingCount > 0;
+			// Reinforcements raise the baseline instead of reading as negative casualties.
+			Group->InitialLivingCount = FMath::Max(Group->InitialLivingCount, LivingCount);
+			const int32 Lost = Group->LastLivingCount - LivingCount;
+			if (Lost > 0 && Group->InitialLivingCount > 0 && Group->CollectiveConfig.bEnableMorale)
+			{
+				Group->Morale = FMath::Max(0.0f, Group->Morale
+					- (static_cast<float>(Lost) / static_cast<float>(Group->InitialLivingCount))
+						* Group->CollectiveConfig.CasualtyMoraleWeight);
+			}
+			Group->LastLivingCount = LivingCount;
+		}
+
+		if (Group->CollectiveConfig.bEnableMorale)
+		{
+			UpdateGroupMorale(*Group, CurrentTime, DeltaTime);
+			Group = Groups.Find(GroupHandle);
+			if (!Group)
+			{
+				continue;
+			}
+		}
+
+		if (Group->CollectiveConfig.bEnableThreatTargeting && Group->bEngaged)
+		{
+			UpdateGroupThreat(*Group, CurrentTime, DeltaTime);
+			Group = Groups.Find(GroupHandle);
+			if (!Group)
+			{
+				continue;
+			}
+		}
+
+		const FMassUnitCrowdCollectiveConfig& Collective = Group->CollectiveConfig;
+		if (Group->bEngaged
+			&& !Group->bRouting
+			&& Group->TargetActor.IsValid()
+			&& Collective.bBroadcastAlerts
+			&& Collective.AlertRebroadcastInterval > 0.0f
+			&& Group->EngagementRelayDepth <= Collective.MaxAlertRelayDepth
+			&& CurrentTime >= Group->NextAlertBroadcastTime)
+		{
+			Group->NextAlertBroadcastTime = CurrentTime + Collective.AlertRebroadcastInterval;
+			EmitCrowdSignal(
+				*Group,
+				ECrowdSignalType::Alert,
+				Collective.AlertRadius,
+				Collective.AlertStrength * FMath::Pow(Collective.AlertRelayFalloff, static_cast<float>(Group->EngagementRelayDepth)),
+				Group->TargetActor.Get(),
+				Group->EngagementRelayDepth);
+		}
+	}
+
+	// ---- Deliver what was emitted LAST update (each hop costs one crowd tick).
+	DeliverCrowdSignals(CurrentTime);
+
+	// ---- Recruitment: groups whose reaction delay has elapsed now join the fight.
+	for (const int32 GroupHandle : GroupHandles)
+	{
+		FCrowdGroup* Group = Groups.Find(GroupHandle);
+		if (!Group || !Group->bCollectiveEnabled
+			|| Group->PendingAlertActivationTime < 0.0f
+			|| CurrentTime < Group->PendingAlertActivationTime)
+		{
+			continue;
+		}
+		AActor* RecruitTarget = Group->PendingAlertTarget.Get();
+		const int32 SourceGroup = Group->PendingAlertSourceGroup;
+		const int32 RecruitDepth = Group->PendingRecruitRelayDepth;
+		Group->PendingAlertActivationTime = -1.0f;
+		Group->PendingAlertTarget.Reset();
+		Group->PendingAlertSourceGroup = INDEX_NONE;
+		Group->PendingRecruitRelayDepth = 0;
+		if (Group->bEngaged || Group->bPaused || Group->bRouting || !Group->bEngagementEnabled || !IsValid(RecruitTarget))
+		{
+			Group->Awareness = 0.0f;
+			continue;
+		}
+
+		Group->PendingAlertRelayDepth = RecruitDepth;
+		if (!ActivateCrowdGroupForActor(GroupHandle, RecruitTarget))
+		{
+			if (FCrowdGroup* FailedGroup = Groups.Find(GroupHandle))
+			{
+				FailedGroup->PendingAlertRelayDepth = 0;
+			}
+			continue;
+		}
+		++LastStats.GroupsAlerted;
+		if (FCrowdGroup* AlertedGroup = Groups.Find(GroupHandle))
+		{
+			RequestPresentationCue(*AlertedGroup, EMassUnitCrowdCue::Alerted, GetCollectiveAnchor(*AlertedGroup));
+		}
+		OnCrowdGroupAlerted.Broadcast(GroupHandle, RecruitTarget, SourceGroup);
+	}
+}
+
+void UMassUnitCrowdSystem::DeliverCrowdSignals(float CurrentTime)
+{
+	if (PendingSignals.IsEmpty())
+	{
+		return;
+	}
+	// Swap out first: anything emitted while delivering (recruits relaying) waits for the next update.
+	TArray<FCrowdSignal> Signals = MoveTemp(PendingSignals);
+	PendingSignals.Reset();
+
+	TArray<int32> GroupHandles;
+	Groups.GetKeys(GroupHandles);
+	for (const FCrowdSignal& Signal : Signals)
+	{
+		if (Signal.Radius <= 0.0f || Signal.Strength <= 0.0f)
+		{
+			continue;
+		}
+		const float RadiusSquared = FMath::Square(Signal.Radius);
+		for (const int32 GroupHandle : GroupHandles)
+		{
+			if (GroupHandle == Signal.SourceGroup)
+			{
+				continue;
+			}
+			FCrowdGroup* Receiver = Groups.Find(GroupHandle);
+			if (!Receiver || !Receiver->bCollectiveEnabled || Receiver->bPaused || !DoesSignalReachTeam(Signal, *Receiver))
+			{
+				continue;
+			}
+			const FMassUnitCrowdCollectiveConfig& Collective = Receiver->CollectiveConfig;
+			if (Signal.Type == ECrowdSignalType::Alert)
+			{
+				if (!Collective.bReceiveAlerts || !Receiver->bEngagementEnabled || Receiver->bEngaged || Receiver->bRouting)
+				{
+					continue;
+				}
+			}
+			else if (!Collective.bEnableMorale || Collective.FearSusceptibility <= 0.0f)
+			{
+				continue;
+			}
+
+			const FVector Anchor = GetCollectiveAnchor(*Receiver);
+			const bool bUse3DMovement = Receiver->Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
+			const float DistanceSquared = bUse3DMovement
+				? FVector::DistSquared(Signal.Location, Anchor)
+				: FVector::DistSquared2D(Signal.Location, Anchor);
+			if (DistanceSquared >= RadiusSquared)
+			{
+				continue;
+			}
+			const float Falloff = 1.0f - FMath::Sqrt(DistanceSquared) / Signal.Radius;
+			++LastStats.CollectiveSignalsProcessed;
+
+			if (Signal.Type == ECrowdSignalType::Fear)
+			{
+				Receiver->Morale = FMath::Clamp(Receiver->Morale - Signal.Strength * Falloff * Collective.FearSusceptibility, 0.0f, 1.0f);
+				continue;
+			}
+
+			Receiver->Awareness += Signal.Strength * Falloff * Collective.AlertSensitivity;
+			if (Receiver->PendingAlertActivationTime < 0.0f
+				&& Receiver->Awareness >= Collective.AlertThreshold
+				&& Signal.Target.IsValid())
+			{
+				// Deterministic per group and per alert, like every other crowd random choice.
+				uint32 Seed = HashCombine(::GetTypeHash(Receiver->Config.RandomSeed), ::GetTypeHash(GroupHandle));
+				Seed = HashCombine(Seed, ::GetTypeHash(Receiver->AlertSequence++));
+				FRandomStream DelayStream(static_cast<int32>(Seed));
+				Receiver->PendingAlertActivationTime = CurrentTime
+					+ DelayStream.FRandRange(Collective.MinAlertReactionDelay, Collective.MaxAlertReactionDelay);
+				Receiver->PendingAlertTarget = Signal.Target;
+				Receiver->PendingAlertSourceGroup = Signal.SourceGroup;
+				Receiver->PendingRecruitRelayDepth = Signal.RelayDepth + 1;
+			}
+		}
+	}
+}
+
+void UMassUnitCrowdSystem::UpdateGroupMorale(FCrowdGroup& Group, float CurrentTime, float DeltaTime)
+{
+	const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+	Group.Morale = FMath::Min(1.0f, Group.Morale + Collective.MoraleRecoveryPerSecond * DeltaTime);
+
+	if (!Group.bRouting)
+	{
+		if (Group.bEngaged
+			&& Collective.RoutThreshold > 0.0f
+			&& Group.Morale <= Collective.RoutThreshold
+			&& Group.LastLivingCount > 0)
+		{
+			BeginRout(Group, CurrentTime);
+		}
+	}
+	else if (Group.Morale >= Collective.RallyThreshold
+		&& CurrentTime >= Group.RoutStartTime + Collective.MinRoutDuration)
+	{
+		EndRout(Group, CurrentTime);
+	}
+}
+
+void UMassUnitCrowdSystem::UpdateGroupThreat(FCrowdGroup& Group, float CurrentTime, float DeltaTime)
+{
+	const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+	AActor* CurrentTarget = Group.TargetActor.Get();
+
+	// Exponential decay by half-life, so threat fades at the same rate whatever the update interval.
+	const float DecayFactor = DeltaTime > 0.0f ? FMath::Pow(0.5f, DeltaTime / Collective.ThreatHalfLife) : 1.0f;
+	for (auto It = Group.Threat.CreateIterator(); It; ++It)
+	{
+		AActor* ThreatActor = It->Key.Get();
+		if (!IsValid(ThreatActor) || !PassesTargetFilter(ThreatActor, Group.TeamID))
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		It->Value *= DecayFactor;
+		if (It->Value < 0.01f && ThreatActor != CurrentTarget)
+		{
+			It.RemoveCurrent();
+		}
+	}
+
+	// Proximity threat - at most one entry per player, so this loop is a handful of iterations.
+	if (Collective.ProximityThreatRadius > 0.0f && Collective.ProximityThreatPerSecond > 0.0f && DeltaTime > 0.0f)
+	{
+		const FVector Anchor = GetCollectiveAnchor(Group);
+		const float RadiusSquared = FMath::Square(Collective.ProximityThreatRadius);
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* Controller = It->Get();
+			APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+			if (!IsValid(Pawn) || !PassesTargetFilter(Pawn, Group.TeamID))
+			{
+				continue;
+			}
+			const float DistanceSquared = FVector::DistSquared2D(Anchor, Pawn->GetActorLocation());
+			if (DistanceSquared >= RadiusSquared)
+			{
+				continue;
+			}
+			const float Falloff = 1.0f - FMath::Sqrt(DistanceSquared) / Collective.ProximityThreatRadius;
+			Group.Threat.FindOrAdd(TWeakObjectPtr<AActor>(Pawn)) += Collective.ProximityThreatPerSecond * Falloff * DeltaTime;
+		}
+	}
+
+	AActor* BestActor = nullptr;
+	float BestThreat = 0.0f;
+	for (const TPair<TWeakObjectPtr<AActor>, float>& Pair : Group.Threat)
+	{
+		AActor* Candidate = Pair.Key.Get();
+		if (IsValid(Candidate) && Candidate != CurrentTarget && Pair.Value > BestThreat)
+		{
+			BestActor = Candidate;
+			BestThreat = Pair.Value;
+		}
+	}
+	if (!BestActor)
+	{
+		return;
+	}
+
+	// Lost target: hand the fight to the next most threatening actor instead of disengaging.
+	if (!IsValid(CurrentTarget))
+	{
+		RetargetCrowdGroup(Group, BestActor, CurrentTime);
+		return;
+	}
+	if (CurrentTime - Group.LastTargetSwitchTime < Collective.MinTargetSwitchInterval)
+	{
+		return;
+	}
+	// A floor of one threat point stops vanishingly small values from flipping a group whose current
+	// target has no recorded threat yet.
+	const float CurrentThreat = Group.Threat.FindRef(TWeakObjectPtr<AActor>(CurrentTarget));
+	if (BestThreat > 1.0f && BestThreat > CurrentThreat * (1.0f + Collective.TargetSwitchMargin))
+	{
+		RetargetCrowdGroup(Group, BestActor, CurrentTime);
+	}
+}
+
+bool UMassUnitCrowdSystem::RetargetCrowdGroup(FCrowdGroup& Group, AActor* NewTarget, float CurrentTime)
+{
+	if (!IsValid(NewTarget) || Group.TargetActor.Get() == NewTarget)
+	{
+		return false;
+	}
+	Group.TargetActor = NewTarget;
+	Group.LastTargetLocation = NewTarget->GetActorLocation();
+	Group.NextTargetRefreshTime = CurrentTime + Group.EngagementConfig.TargetRefreshInterval;
+	Group.SharedPathPoints.Reset();
+	Group.bSharedPathUsesNavmesh = false;
+	Group.SharedPathTargetLocation = FVector::ZeroVector;
+	Group.NextSharedPathUpdateTime = 0.0f;
+	// Tokens were granted against the old target's range; start the new fight with a clean pool.
+	Group.AttackTokenExpiry.Reset();
+	Group.LastTargetSwitchTime = CurrentTime;
+
+	if (EntitySubsystem)
+	{
+		FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+		for (const FMassUnitEntityHandle Entity : Group.Units)
+		{
+			if (!IsEntityValid(Entity))
+			{
+				continue;
+			}
+			if (FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle()))
+			{
+				Crowd->NextFollowUpdateTime = 0.0f;
+				Crowd->LastFollowTargetLocation = FVector::ZeroVector;
+			}
+		}
+	}
+
+	++LastStats.TargetSwitches;
+	const int32 GroupHandle = Group.Handle;
+	RequestPresentationCue(Group, EMassUnitCrowdCue::TargetChanged, GetCollectiveAnchor(Group));
+	OnCrowdGroupTargetChanged.Broadcast(GroupHandle, NewTarget);
+	return true;
+}
+
+void UMassUnitCrowdSystem::BeginRout(FCrowdGroup& Group, float CurrentTime)
+{
+	Group.bRouting = true;
+	Group.RoutStartTime = CurrentTime;
+	Group.AttackTokenExpiry.Reset();
+	Group.PendingAlertActivationTime = -1.0f;
+	Group.PendingAlertTarget.Reset();
+
+	// Each unit picks a flee destination on its first routed visit rather than finishing its approach.
+	if (EntitySubsystem)
+	{
+		FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+		for (const FMassUnitEntityHandle Entity : Group.Units)
+		{
+			if (!IsEntityValid(Entity))
+			{
+				continue;
+			}
+			if (FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle()))
+			{
+				Crowd->NextFollowUpdateTime = 0.0f;
+			}
+		}
+	}
+
+	const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+	if (Collective.bBroadcastFear && Collective.FearStrength > 0.0f)
+	{
+		EmitCrowdSignal(Group, ECrowdSignalType::Fear, Collective.FearRadius, Collective.FearStrength, Group.TargetActor.Get(), 0);
+	}
+	const int32 GroupHandle = Group.Handle;
+	AActor* FleeingFrom = Group.TargetActor.Get();
+	RequestPresentationCue(Group, EMassUnitCrowdCue::Routed, GetCollectiveAnchor(Group));
+	OnCrowdGroupRouted.Broadcast(GroupHandle, FleeingFrom);
+}
+
+void UMassUnitCrowdSystem::EndRout(FCrowdGroup& Group, float CurrentTime)
+{
+	Group.bRouting = false;
+	// Force a fresh engaged destination; otherwise the repath-distance gate keeps the flee point.
+	if (EntitySubsystem)
+	{
+		FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+		for (const FMassUnitEntityHandle Entity : Group.Units)
+		{
+			if (!IsEntityValid(Entity))
+			{
+				continue;
+			}
+			if (FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle()))
+			{
+				Crowd->NextFollowUpdateTime = 0.0f;
+				Crowd->LastFollowTargetLocation = FVector::ZeroVector;
+				Crowd->LastDestination = FVector::ZeroVector;
+			}
+		}
+	}
+	const int32 GroupHandle = Group.Handle;
+	AActor* Target = Group.TargetActor.Get();
+	RequestPresentationCue(Group, EMassUnitCrowdCue::Rallied, GetCollectiveAnchor(Group));
+	OnCrowdGroupRallied.Broadcast(GroupHandle, Target);
+}
+
+bool UMassUnitCrowdSystem::HasRoutReachedUnit(
+	FMassUnitEntityHandle Entity,
+	const FCrowdGroup& Group,
+	float CurrentTime) const
+{
+	const float StaggerTime = Group.CollectiveConfig.RoutStaggerTime;
+	if (StaggerTime <= 0.0f)
+	{
+		return true;
+	}
+	uint32 Seed = HashCombine(::GetTypeHash(Group.Config.RandomSeed), GetTypeHash(Entity));
+	Seed = HashCombine(Seed, 0x0F1EE000u);
+	const float UnitOffset = (static_cast<float>(Seed % 1024u) / 1023.0f) * StaggerTime;
+	return CurrentTime >= Group.RoutStartTime + UnitOffset;
+}
+
+bool UMassUnitCrowdSystem::UpdateRoutingUnit(
+	const FSpatialEntry& Entry,
+	FCrowdGroup& Group,
+	float CurrentTime,
+	bool bForceDecision)
+{
+	if (!EntitySubsystem || !UnitManager || !IsEntityValid(Entry.Entity))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = Entry.Entity.ToMassEntityHandle();
+	FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	FMassUnitNavigationFragment* Navigation = EntityManager.GetFragmentDataPtr<FMassUnitNavigationFragment>(NativeHandle);
+	FMassUnitLookAtFragment* LookAt = EntityManager.GetFragmentDataPtr<FMassUnitLookAtFragment>(NativeHandle);
+	if (!Crowd || !State || !Navigation)
+	{
+		return false;
+	}
+	const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+
+	// A fleeing unit never holds a token, so the pool is free the moment the group rallies.
+	Group.AttackTokenExpiry.Remove(Entry.Entity);
+	State->PendingAttackDamage = 0.0f;
+	if (State->CurrentState == EMassUnitState::Attacking)
+	{
+		State->CurrentState = EMassUnitState::Idle;
+		State->StateTime = 0.0f;
+	}
+	State->MoveSpeed = Crowd->BaseMoveSpeed * Collective.FleeSpeedMultiplier;
+
+	if (!bForceDecision && CurrentTime < Crowd->NextFollowUpdateTime)
+	{
+		return true;
+	}
+	Crowd->NextFollowUpdateTime = CurrentTime + Collective.FleeRepathInterval;
+	Crowd->NextDecisionTime = TNumericLimits<float>::Max();
+
+	const bool bUse3DMovement = Group.Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
+	const FVector FromTarget = Entry.Location - Group.LastTargetLocation;
+	FVector AwayDirection = bUse3DMovement ? FromTarget.GetSafeNormal() : FromTarget.GetSafeNormal2D();
+	FRandomStream FleeStream = MakeRandomStream(Entry.Entity, Group, Crowd->DecisionSequence++);
+	if (AwayDirection.IsNearlyZero())
+	{
+		const float Angle = FleeStream.FRandRange(0.0f, 2.0f * UE_PI);
+		AwayDirection = FVector(FMath::Cos(Angle), FMath::Sin(Angle), 0.0f);
+	}
+	else if (!bUse3DMovement)
+	{
+		// Fan the rout out a little so units do not stream away in one file.
+		AwayDirection = AwayDirection.RotateAngleAxis(FleeStream.FRandRange(-25.0f, 25.0f), FVector::UpVector);
+	}
+
+	FVector Destination = Entry.Location + AwayDirection * Collective.FleeDistance;
+	bool bDestinationOnNavmesh = false;
+	if (!bUse3DMovement)
+	{
+		Destination.Z = Entry.Location.Z;
+		FVector Projected;
+		if (Group.bUseNavigation && NavigationSystem && NavigationSystem->ProjectPointToNavigation(Destination, Projected))
+		{
+			Destination.X = Projected.X;
+			Destination.Y = Projected.Y;
+			if (Group.Config.bConformToNavmeshHeight)
+			{
+				Destination.Z = Projected.Z;
+				bDestinationOnNavmesh = true;
+			}
+		}
+	}
+
+	if (!UnitManager->SetUnitDestination(FMassUnitHandle(Entry.Entity), Destination, Group.AcceptanceRadius))
+	{
+		Crowd->NextFollowUpdateTime = CurrentTime + UpdateInterval;
+		return false;
+	}
+	// Same provenance rule as the shared corridors: the movement processor adds the pivot offset once.
+	Navigation->bPathUsesNavmesh = bDestinationOnNavmesh;
+	Crowd->LastDestination = Destination;
+	if (LookAt)
+	{
+		LookAt->Direction = AwayDirection;
+	}
+	++LastStats.DestinationsAssigned;
+	return true;
+}
+
+void UMassUnitCrowdSystem::EmitCrowdSignal(
+	FCrowdGroup& Group,
+	ECrowdSignalType Type,
+	float Radius,
+	float Strength,
+	AActor* Target,
+	int32 RelayDepth)
+{
+	if (Radius <= 0.0f || Strength <= 0.0f)
+	{
+		return;
+	}
+	FCrowdSignal Signal;
+	Signal.Type = Type;
+	Signal.SourceGroup = Group.Handle;
+	Signal.TeamID = Group.TeamID;
+	Signal.Location = GetCollectiveAnchor(Group);
+	Signal.Radius = Radius;
+	Signal.Strength = Strength;
+	Signal.Target = Target;
+	Signal.RelayDepth = RelayDepth;
+	QueueCrowdSignal(Signal);
+
+#if ENABLE_DRAW_DEBUG
+	const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+	if (World && Collective.bEnableVisualDebug && Collective.bDebugDrawSignals)
+	{
+		const FColor Color = Type == ECrowdSignalType::Alert ? FColor::Orange : FColor::Purple;
+		DrawDebugCircle(World, Signal.Location + FVector(0.0f, 0.0f, 20.0f), Radius, 64, Color, false, 1.0f, 0, 8.0f,
+			FVector::ForwardVector, FVector::RightVector, false);
+	}
+#endif
+}
+
+void UMassUnitCrowdSystem::QueueCrowdSignal(const FCrowdSignal& Signal)
+{
+	if (PendingSignals.Num() >= MaxPendingSignals)
+	{
+		UE_LOG(LogMassUnitSystem, Warning,
+			TEXT("Crowd collective: signal queue full (%d); dropping a signal. Check alert relay depth and rebroadcast intervals."),
+			MaxPendingSignals);
+		return;
+	}
+	PendingSignals.Add(Signal);
+}
+
+int32 UMassUnitCrowdSystem::CountLivingUnits(const FCrowdGroup& Group, FVector* OutAnchor) const
+{
+	if (!EntitySubsystem)
+	{
+		return 0;
+	}
+	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
+	FVector Sum = FVector::ZeroVector;
+	int32 LivingCount = 0;
+	for (const FMassUnitEntityHandle Entity : Group.Units)
+	{
+		if (!IsEntityValid(Entity))
+		{
+			continue;
+		}
+		const FMassEntityHandle NativeHandle = Entity.ToMassEntityHandle();
+		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+		if (State && State->CurrentState == EMassUnitState::Dead)
+		{
+			continue;
+		}
+		if (const FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(NativeHandle))
+		{
+			Sum += Transform->GetTransform().GetLocation();
+		}
+		++LivingCount;
+	}
+	if (OutAnchor && LivingCount > 0)
+	{
+		*OutAnchor = Sum / static_cast<float>(LivingCount);
+	}
+	return LivingCount;
+}
+
+FVector UMassUnitCrowdSystem::GetCollectiveAnchor(const FCrowdGroup& Group) const
+{
+	return Group.bHasCachedAnchor ? Group.CachedAnchor : CalculateGroupAnchor(Group);
+}
+
+int32 UMassUnitCrowdSystem::ResolveGroupTeamID(const FCrowdGroup& Group) const
+{
+	if (!EntitySubsystem)
+	{
+		return INDEX_NONE;
+	}
+	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
+	for (const FMassUnitEntityHandle Entity : Group.Units)
+	{
+		if (!IsEntityValid(Entity))
+		{
+			continue;
+		}
+		if (const FMassUnitTeamFragment* Team = EntityManager.GetFragmentDataPtr<FMassUnitTeamFragment>(Entity.ToMassEntityHandle()))
+		{
+			return Team->TeamID;
+		}
+	}
+	return INDEX_NONE;
+}
+
+AActor* UMassUnitCrowdSystem::ResolveThreatActor(AActor* Actor)
+{
+	if (!IsValid(Actor))
+	{
+		return nullptr;
+	}
+	if (Actor->IsA<APawn>())
+	{
+		return Actor;
+	}
+	// Projectiles, grenades, and beams report themselves as the causer. A crowd must chase whoever
+	// fired them - a pooled projectile stays "valid" while hidden and would otherwise be chased forever.
+	if (APawn* InstigatorPawn = Actor->GetInstigator())
+	{
+		return InstigatorPawn;
+	}
+	if (APawn* OwnerPawn = Cast<APawn>(Actor->GetOwner()))
+	{
+		return OwnerPawn;
+	}
+	// A causer with no instigator and no owner is a stand-alone actor (turret, trap, test dummy) and is
+	// itself the attacker. Anything that HAS an owner but no resolvable pawn is a sub-object of
+	// something we cannot chase meaningfully, so it is ignored.
+	return Actor->GetOwner() == nullptr ? Actor : nullptr;
+}
+
+bool UMassUnitCrowdSystem::DoesSignalReachTeam(const FCrowdSignal& Signal, const FCrowdGroup& Receiver)
+{
+	if (!Receiver.CollectiveConfig.bSignalsSameTeamOnly || Signal.TeamID < 0 || Receiver.TeamID < 0)
+	{
+		return true;
+	}
+	return Signal.TeamID == Receiver.TeamID;
+}
+
+void UMassUnitCrowdSystem::DrawCollectiveDebug(float CurrentTime)
+{
+#if ENABLE_DRAW_DEBUG
+	if (!World)
+	{
+		return;
+	}
+	const float Duration = UpdateInterval * 1.5f;
+	bool bDrawHUD = false;
+	int32 DebugGroups = 0;
+	for (const TPair<int32, FCrowdGroup>& Pair : Groups)
+	{
+		const FCrowdGroup& Group = Pair.Value;
+		const FMassUnitCrowdCollectiveConfig& Collective = Group.CollectiveConfig;
+		if (!Group.bCollectiveEnabled || !Collective.bEnableVisualDebug)
+		{
+			continue;
+		}
+		++DebugGroups;
+		bDrawHUD |= Collective.bDebugDrawScreenHUD;
+		const FVector Anchor = Group.bHasCachedAnchor ? Group.CachedAnchor : Group.Center;
+		const bool bRecruiting = Group.PendingAlertActivationTime >= 0.0f;
+
+		if (Collective.bDebugDrawGroupStatus)
+		{
+			const FColor StatusColor = Group.bRouting ? FColor::Red
+				: Group.bEngaged ? FColor::Green
+				: bRecruiting ? FColor::Orange
+				: FColor::White;
+			const TCHAR* StatusText = Group.bRouting ? TEXT("ROUTED")
+				: Group.bEngaged ? TEXT("ENGAGED")
+				: bRecruiting ? TEXT("RECRUITING")
+				: TEXT("AMBIENT");
+			DrawDebugString(World, Anchor + FVector(0.0f, 0.0f, 260.0f),
+				FString::Printf(TEXT("Crowd %d  %s\nMorale %.2f  Aware %.2f  Relay %d"),
+					Pair.Key, StatusText, Group.Morale, Group.Awareness, Group.EngagementRelayDepth),
+				nullptr, StatusColor, Duration, true);
+			// Morale bar: full width is 1.0, red/green threshold ticks at rout and rally.
+			const FVector BarStart = Anchor + FVector(0.0f, -100.0f, 230.0f);
+			DrawDebugLine(World, BarStart, BarStart + FVector(0.0f, 200.0f, 0.0f), FColor(60, 60, 60), false, Duration, 0, 6.0f);
+			DrawDebugLine(World, BarStart, BarStart + FVector(0.0f, 200.0f * Group.Morale, 0.0f), StatusColor, false, Duration, 1, 6.0f);
+			if (Collective.bEnableMorale)
+			{
+				const FVector RoutTick = BarStart + FVector(0.0f, 200.0f * Collective.RoutThreshold, 0.0f);
+				const FVector RallyTick = BarStart + FVector(0.0f, 200.0f * Collective.RallyThreshold, 0.0f);
+				DrawDebugLine(World, RoutTick - FVector(0.0f, 0.0f, 12.0f), RoutTick + FVector(0.0f, 0.0f, 12.0f), FColor::Red, false, Duration, 2, 2.0f);
+				DrawDebugLine(World, RallyTick - FVector(0.0f, 0.0f, 12.0f), RallyTick + FVector(0.0f, 0.0f, 12.0f), FColor::Green, false, Duration, 2, 2.0f);
+			}
+		}
+
+		if (Collective.bDebugDrawThreat && Group.bEngaged)
+		{
+			if (const AActor* Target = Group.TargetActor.Get())
+			{
+				const FVector TargetLocation = Target->GetActorLocation();
+				DrawDebugLine(World, Anchor, TargetLocation, FColor::Magenta, false, Duration, 0, 2.0f);
+				DrawDebugString(World, (Anchor + TargetLocation) * 0.5f,
+					FString::Printf(TEXT("Threat %.0f (%d tracked)"), Group.Threat.FindRef(Group.TargetActor), Group.Threat.Num()),
+					nullptr, FColor::Magenta, Duration, true);
+			}
+		}
+	}
+
+	if (bDrawHUD && GEngine)
+	{
+		int32 Key = 7300;  // Crowd collective HUD key range: 7300-7309
+		GEngine->AddOnScreenDebugMessage(Key++, Duration, FColor::Cyan, TEXT("=== CROWD COLLECTIVE ==="));
+		GEngine->AddOnScreenDebugMessage(Key++, Duration, FColor::White,
+			FString::Printf(TEXT("Debug groups %d | Routing %d | Alerted %d | Signals %d (queued %d) | Target switches %d"),
+				DebugGroups, LastStats.RoutingGroups, LastStats.GroupsAlerted,
+				LastStats.CollectiveSignalsProcessed, PendingSignals.Num(), LastStats.TargetSwitches));
+	}
+#endif
+}
+
+FMassUnitCrowdCollectiveConfig UMassUnitCrowdSystem::SanitizeCollectiveConfig(const FMassUnitCrowdCollectiveConfig& Config)
+{
+	FMassUnitCrowdCollectiveConfig Result = Config;
+	Result.AlertRadius = FMath::Max(1.0f, Result.AlertRadius);
+	Result.AlertStrength = FMath::Max(0.0f, Result.AlertStrength);
+	Result.AlertRebroadcastInterval = FMath::Max(0.0f, Result.AlertRebroadcastInterval);
+	Result.MaxAlertRelayDepth = FMath::Clamp(Result.MaxAlertRelayDepth, 0, 8);
+	Result.AlertRelayFalloff = FMath::Clamp(Result.AlertRelayFalloff, 0.0f, 1.0f);
+	Result.AlertSensitivity = FMath::Max(0.0f, Result.AlertSensitivity);
+	Result.AlertThreshold = FMath::Max(0.01f, Result.AlertThreshold);
+	Result.AwarenessDecayPerSecond = FMath::Max(0.0f, Result.AwarenessDecayPerSecond);
+	Result.MinAlertReactionDelay = FMath::Max(0.0f, Result.MinAlertReactionDelay);
+	Result.MaxAlertReactionDelay = FMath::Max(Result.MinAlertReactionDelay, Result.MaxAlertReactionDelay);
+	Result.CasualtyMoraleWeight = FMath::Max(0.0f, Result.CasualtyMoraleWeight);
+	Result.MoraleRecoveryPerSecond = FMath::Max(0.0f, Result.MoraleRecoveryPerSecond);
+	Result.RoutThreshold = FMath::Clamp(Result.RoutThreshold, 0.0f, 1.0f);
+	// Rally must sit above rout or a group would rally and re-rout on the same evaluation.
+	Result.RallyThreshold = FMath::Clamp(Result.RallyThreshold, FMath::Min(1.0f, Result.RoutThreshold + 0.05f), 1.0f);
+	Result.MinRoutDuration = FMath::Max(0.0f, Result.MinRoutDuration);
+	Result.RoutStaggerTime = FMath::Max(0.0f, Result.RoutStaggerTime);
+	Result.FleeDistance = FMath::Max(1.0f, Result.FleeDistance);
+	Result.FleeSpeedMultiplier = FMath::Clamp(Result.FleeSpeedMultiplier, 0.05f, 4.0f);
+	Result.FleeRepathInterval = FMath::Max(0.1f, Result.FleeRepathInterval);
+	Result.MoraleEvaluationInterval = FMath::Max(0.05f, Result.MoraleEvaluationInterval);
+	Result.FearRadius = FMath::Max(1.0f, Result.FearRadius);
+	Result.FearStrength = FMath::Clamp(Result.FearStrength, 0.0f, 1.0f);
+	Result.FearSusceptibility = FMath::Max(0.0f, Result.FearSusceptibility);
+	Result.DamageThreatScale = FMath::Max(0.0f, Result.DamageThreatScale);
+	Result.ProximityThreatRadius = FMath::Max(0.0f, Result.ProximityThreatRadius);
+	Result.ProximityThreatPerSecond = FMath::Max(0.0f, Result.ProximityThreatPerSecond);
+	Result.ThreatHalfLife = FMath::Max(0.1f, Result.ThreatHalfLife);
+	Result.TargetSwitchMargin = FMath::Max(0.0f, Result.TargetSwitchMargin);
+	Result.MinTargetSwitchInterval = FMath::Max(0.0f, Result.MinTargetSwitchInterval);
 	return Result;
 }
 

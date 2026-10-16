@@ -1,9 +1,12 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Visual/CrowdInstanceRenderer.h"
+#include "Core/MassUnitStats.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Config/MassUnitSystemSettings.h"
+#include "Core/MassUnitGameplayTags.h"
+#include "Entity/UnitTemplate.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Entity/MassUnitFragments.h"
@@ -31,6 +34,48 @@ namespace
 	float MakeRandomSeed(FMassEntityHandle Entity)
 	{
 		return FMath::Frac(static_cast<float>(Entity.Index) * 0.6180339887f);
+	}
+
+	/** Clip playback data for one instance; all zero when the template has no clip table. */
+	struct FResolvedClip
+	{
+		float StartTime = 0.0f;
+		float StartFrame = 0.0f;
+		float FrameCount = 0.0f;
+		float FramesPerSecond = 0.0f;
+	};
+
+	/**
+	 * Picks the clip row for the unit's animation tag. A finished one-shot clip (an attack, a hit) hands
+	 * over to Idle with the start stamp moved to the clip's end, so the material needs no state of its own.
+	 * Death and Stun never hand over: corpses hold their last frame, and a stun lasts as long as the status.
+	 */
+	FResolvedClip ResolveClip(const FMassUnitVisualFragment& Visual, const FMassUnitStateFragment& State, float CurrentTime)
+	{
+		FResolvedClip Result;
+		Result.StartTime = CurrentTime - State.StateTime;
+		const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+		const FMassUnitVATClip* Clip = Template ? Template->FindVertexAnimationClip(Visual.CurrentAnimation) : nullptr;
+		if (!Clip)
+		{
+			return Result;
+		}
+		if (!Clip->bLoop
+			&& Clip->bReturnToIdleWhenDone
+			&& Visual.CurrentAnimation != Tags::AnimationDeath()
+			&& Visual.CurrentAnimation != Tags::AnimationStun()
+			&& State.StateTime >= Clip->GetDuration())
+		{
+			if (const FMassUnitVATClip* Idle = Template->FindVertexAnimationClip(Tags::AnimationIdle()))
+			{
+				Result.StartTime += Clip->GetDuration();
+				Clip = Idle;
+			}
+		}
+		Result.StartFrame = static_cast<float>(Clip->StartFrame);
+		Result.FrameCount = static_cast<float>(FMath::Max(1, Clip->NumFrames));
+		Result.FramesPerSecond = Clip->bLoop ? Clip->FramesPerSecond : -Clip->FramesPerSecond;
+		return Result;
 	}
 
 	/** Free slots must outnumber this before a bucket bothers trimming its tail. */
@@ -85,6 +130,8 @@ int32 UCrowdInstanceRenderer::GetAllocatedSlotCount() const
 	return Count;
 }
 
+DECLARE_CYCLE_STAT(TEXT("Instance Renderer Update"), STAT_MassUnit_RendererUpdate, STATGROUP_MassUnitSystem);
+
 void UCrowdInstanceRenderer::UpdateInstances(
 	const TArray<FMassUnitEntityHandle>& Entities,
 	TFunctionRef<int32(const FMassUnitVisualFragment&, const FMassUnitStateFragment&)> AnimationIndexResolver)
@@ -95,6 +142,7 @@ void UCrowdInstanceRenderer::UpdateInstances(
 	}
 
 	TRACE_CPUPROFILER_EVENT_SCOPE(UCrowdInstanceRenderer::UpdateInstances);
+	SCOPE_CYCLE_COUNTER(STAT_MassUnit_RendererUpdate);
 
 	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
 	const float CurrentTime = World->GetTimeSeconds();
@@ -167,7 +215,8 @@ void UCrowdInstanceRenderer::UpdateInstances(
 		// StateTime accumulates, so CurrentTime - StateTime is a stable start stamp that only moves when
 		// the unit actually changes state. Uploading it instead of the elapsed time keeps the custom-data
 		// buffer unchanged on the vast majority of updates.
-		const float AnimationStartTime = CurrentTime - State->StateTime;
+		const FResolvedClip Clip = ResolveClip(*Visual, *State, CurrentTime);
+		const float AnimationStartTime = Clip.StartTime;
 		const float HealthPercent = State->MaxHealth > UE_SMALL_NUMBER
 			? FMath::Clamp(State->Health / State->MaxHealth, 0.0f, 1.0f)
 			: 0.0f;
@@ -180,8 +229,13 @@ void UCrowdInstanceRenderer::UpdateInstances(
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::TeamColorG, Team->TeamColor.G);
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::TeamColorB, Team->TeamColor.B);
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::HealthPercent, HealthPercent, 0.01f);
-		WriteCustomData(*Bucket, Slot, CrowdCustomData::RandomSeed, MakeRandomSeed(NativeHandle));
+		// The unit's stored variant seed (replicated to client puppets); the index-derived value only if unset.
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::RandomSeed,
+			Visual->VariantSeed >= 0.0f ? Visual->VariantSeed : MakeRandomSeed(NativeHandle));
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::Speed, Speed, 5.0f);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipStartFrame, Clip.StartFrame);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipFrameCount, Clip.FrameCount);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipFramesPerSecond, Clip.FramesPerSecond);
 	}
 
 	for (TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)

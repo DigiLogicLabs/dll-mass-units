@@ -383,6 +383,9 @@ The package build checks Editor Development, Game Development, Game Shipping, an
 - [Usage and integration](docs/usage.md)
 - [Public API](docs/api.md)
 - [Architecture](docs/architecture.md)
+- [Scalability best practices](docs/scalability_best_practices.md) — the rules for building at crowd scale, with rationale
+- [Authoring pipeline (Blender to crowd unit)](docs/authoring_pipeline.md) — rig, budgets, LODs, VAT bake
+- [Artist brief](docs/artist_brief.md) — self-contained spec sheet to hand a modeller
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## Intentional boundaries

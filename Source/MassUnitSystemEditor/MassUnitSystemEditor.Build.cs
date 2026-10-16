@@ -23,6 +23,7 @@ public class MassUnitSystemEditor : ModuleRules
 			{
 				"UnrealEd",
 				"MassEntity",
+				"GameplayTags",
 				"Slate",
 				"SlateCore"
 			}

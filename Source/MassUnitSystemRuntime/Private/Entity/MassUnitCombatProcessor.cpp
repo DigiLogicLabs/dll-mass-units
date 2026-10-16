@@ -1,6 +1,7 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Entity/MassUnitCombatProcessor.h"
+#include "Core/MassUnitStats.h"
 
 #include "Core/MassUnitGameplayTags.h"
 #include "Core/MassUnitSubsystem.h"
@@ -27,8 +28,11 @@ void UMassUnitCombatProcessor::ConfigureQueries(const TSharedRef<FMassEntityMana
 	EntityQuery.AddRequirement<FMassUnitVisualFragment>(EMassFragmentAccess::ReadWrite);
 }
 
+DECLARE_CYCLE_STAT(TEXT("Combat Processor"), STAT_MassUnit_CombatProcessor, STATGROUP_MassUnitSystem);
+
 void UMassUnitCombatProcessor::Execute(FMassEntityManager& EntityManager, FMassExecutionContext& Context)
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_CombatProcessor);
 	const float DeltaTime = FMath::Min(Context.GetDeltaTimeSeconds(), 0.1f);
 	UMassUnitEntityManager* UnitManager = nullptr;
 	if (UWorld* World = Context.GetWorld())
@@ -53,14 +57,18 @@ void UMassUnitCombatProcessor::Execute(FMassEntityManager& EntityManager, FMassE
 			FMassUnitVisualFragment& Visual = Visuals[It];
 			State.AttackCooldownRemaining = FMath::Max(0.0f, State.AttackCooldownRemaining - DeltaTime);
 
-			if (State.CurrentState == EMassUnitState::Dead || !Target.TargetEntity.IsValid())
+			if (State.CurrentState == EMassUnitState::Dead
+				|| State.CurrentState == EMassUnitState::Stunned
+				|| !Target.TargetEntity.IsValid())
 			{
+				State.PendingAttackDamage = 0.0f;
 				continue;
 			}
 
 			const FMassEntityHandle TargetHandle = Target.TargetEntity.ToMassEntityHandle();
 			if (!EntityManager.IsEntityValid(TargetHandle))
 			{
+				State.PendingAttackDamage = 0.0f;
 				Target.Clear();
 				continue;
 			}
@@ -70,6 +78,8 @@ void UMassUnitCombatProcessor::Execute(FMassEntityManager& EntityManager, FMassE
 			const FMassUnitTeamFragment* TargetTeam = EntityManager.GetFragmentDataPtr<FMassUnitTeamFragment>(TargetHandle);
 			if (!TargetState || !TargetTransform || !TargetTeam || TargetState->CurrentState == EMassUnitState::Dead || TargetTeam->TeamID == Teams[It].TeamID)
 			{
+				// The swing was aimed at this target; it must not land on whatever is acquired next.
+				State.PendingAttackDamage = 0.0f;
 				if (TargetState && TargetState->CurrentState == EMassUnitState::Dead)
 				{
 					Target.Clear();
@@ -81,6 +91,8 @@ void UMassUnitCombatProcessor::Execute(FMassEntityManager& EntityManager, FMassE
 			const float DistanceSquared = FVector::DistSquared2D(Transforms[It].GetTransform().GetLocation(), Target.TargetLocation);
 			if (DistanceSquared > FMath::Square(State.AttackRange))
 			{
+				// The target stepped out of reach mid-swing: the swing whiffs.
+				State.PendingAttackDamage = 0.0f;
 				continue;
 			}
 
@@ -91,10 +103,15 @@ void UMassUnitCombatProcessor::Execute(FMassEntityManager& EntityManager, FMassE
 			}
 			Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationAttack();
 
-			if (State.AttackCooldownRemaining <= 0.0f)
+			if (State.AttackCooldownRemaining <= 0.0f && State.PendingAttackDamage <= 0.0f)
 			{
-				const float Damage = State.BaseDamage * FMath::Max(1, State.UnitLevel) * DamageMultiplier;
+				// Every swing restarts the attack clip; damage lands at the template's impact delay.
+				State.BeginAttackSwing(State.BaseDamage * FMath::Max(1, State.UnitLevel) * DamageMultiplier);
 				State.AttackCooldownRemaining = State.AttackCooldown;
+			}
+			const float Damage = State.ConsumeAttackImpact();
+			if (Damage > 0.0f)
+			{
 				if (UnitManager)
 				{
 					// The facade owns health/death events and defers them until this Mass

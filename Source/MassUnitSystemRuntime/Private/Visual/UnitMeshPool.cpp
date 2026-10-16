@@ -6,10 +6,14 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
+#include "Engine/CollisionProfile.h"
 #include "Engine/World.h"
+#include "PhysicsEngine/PhysicsAsset.h"
 #include "Entity/MassUnitFragments.h"
 #include "MassEntityManager.h"
 #include "MassEntitySubsystem.h"
+#include "MassUnitCommonFragments.h"
+#include "Visual/MassUnitAnimInstance.h"
 
 void UUnitMeshPool::Initialize(UWorld* InWorld, UMassEntitySubsystem* InEntitySubsystem, int32 PoolSize)
 {
@@ -50,6 +54,7 @@ void UUnitMeshPool::Deinitialize()
 	EntityMeshMap.Reset();
 	MeshEntityMap.Reset();
 	MeshAnimationTags.Reset();
+	MeshAttackSerials.Reset();
 	EntitySubsystem = nullptr;
 	World = nullptr;
 }
@@ -69,6 +74,10 @@ void UUnitMeshPool::UpdateUnitMeshes(const TArray<FMassUnitEntityHandle>& Entiti
 		{
 			MeshesToRelease.Add(Pair.Value);
 			continue;
+		}
+		if (RagdollMeshes.Contains(Pair.Value))
+		{
+			continue;   // a ragdoll stays until its unit is destroyed, whatever the camera does
 		}
 		const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
 			Pair.Key.ToMassEntityHandle());
@@ -107,7 +116,10 @@ void UUnitMeshPool::UpdateUnitMeshes(const TArray<FMassUnitEntityHandle>& Entiti
 		if (USkeletalMeshComponent* Existing = EntityMeshMap.FindRef(Entity))
 		{
 			Visual->bUseSkeletalMesh = true;
-			UpdateMeshFromEntity(Existing, Entity);
+			if (!RagdollMeshes.Contains(Existing))
+			{
+				UpdateMeshFromEntity(Existing, Entity);
+			}
 		}
 		else if (Visual->bWantsSkeletalMesh && Visual->bIsVisible && Visual->SkeletalMesh)
 		{
@@ -197,6 +209,15 @@ void UUnitMeshPool::ReleaseMesh(USkeletalMeshComponent* Mesh)
 		}
 	}
 	MeshAnimationTags.Remove(Mesh);
+	MeshAttackSerials.Remove(Mesh);
+	if (RagdollMeshes.Remove(Mesh) > 0)
+	{
+		// Back to an animated, collision-free pool mesh.
+		Mesh->SetSimulatePhysics(false);
+		Mesh->SetAllPhysicsLinearVelocity(FVector::ZeroVector);
+		Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Mesh->SetCollisionProfileName(UCollisionProfile::NoCollision_ProfileName);
+	}
 	Mesh->SetVisibility(false);
 	Mesh->SetAnimInstanceClass(nullptr);
 	Mesh->SetSkeletalMeshAsset(nullptr);
@@ -291,14 +312,53 @@ void UUnitMeshPool::UpdateMeshFromEntity(USkeletalMeshComponent* Mesh, FMassUnit
 		Mesh->SetSkeletalMeshAsset(Visual->SkeletalMesh);
 		MeshAnimationTags.Remove(Mesh);
 	}
-	if (UAnimationAsset* Animation = ResolveAnimationAsset(*Visual))
+	const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	const float StateTime = State ? State->StateTime : 0.0f;
+	const int32 AttackSerial = State ? State->AttackSerial : 0;
+
+	FGameplayTag PlayTag = Visual->CurrentAnimation;
+	UAnimationAsset* Animation = ResolveAnimationAsset(*Visual);
+	float Elapsed = StateTime;
+	// A finished one-shot (an attack between swings) hands over to Idle, mirroring the crowd renderer so
+	// promotion and demotion between the two bands do not change what the unit is doing. Death holds.
+	if (Animation && !ShouldLoopAnimation(PlayTag)
+		&& PlayTag != UE::MassUnitSystem::Tags::AnimationDeath()
+		&& PlayTag != UE::MassUnitSystem::Tags::AnimationStun()
+		&& Visual->IdleAnimation)
 	{
-		if (MeshAnimationTags.FindRef(Mesh) != Visual->CurrentAnimation)
+		const float OneShotLength = Animation->GetPlayLength();
+		if (OneShotLength > UE_SMALL_NUMBER && StateTime >= OneShotLength)
 		{
-			Mesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
-			Mesh->PlayAnimation(Animation, ShouldLoopAnimation(Visual->CurrentAnimation));
-			MeshAnimationTags.Add(Mesh, Visual->CurrentAnimation);
+			PlayTag = UE::MassUnitSystem::Tags::AnimationIdle();
+			Animation = Visual->IdleAnimation;
+			Elapsed = StateTime - OneShotLength;
 		}
+	}
+
+	if (Animation)
+	{
+		const bool bNewSwing = PlayTag == UE::MassUnitSystem::Tags::AnimationAttack()
+			&& MeshAttackSerials.FindRef(Mesh) != AttackSerial;
+		if (MeshAnimationTags.FindRef(Mesh) != PlayTag || bNewSwing)
+		{
+			const bool bLoop = ShouldLoopAnimation(PlayTag);
+			Mesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+			Mesh->PlayAnimation(Animation, bLoop);
+
+			// Start where the vertex-animation band would be, including its per-unit loop phase offset,
+			// so a unit crossing the promotion distance continues its cycle instead of snapping to frame 0.
+			const float Length = Animation->GetPlayLength();
+			if (Length > UE_SMALL_NUMBER)
+			{
+				const float Seed = FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.6180339887f);
+				const float Position = bLoop
+					? FMath::Fmod(Elapsed + Seed * Length, Length)
+					: FMath::Clamp(Elapsed, 0.0f, Length);
+				Mesh->SetPosition(Position, /*bFireNotifies*/ false);
+			}
+			MeshAnimationTags.Add(Mesh, PlayTag);
+		}
+		MeshAttackSerials.Add(Mesh, AttackSerial);
 	}
 	else if (Visual->AnimationBlueprintClass)
 	{
@@ -307,6 +367,22 @@ void UUnitMeshPool::UpdateMeshFromEntity(USkeletalMeshComponent* Mesh, FMassUnit
 		{
 			Mesh->SetAnimInstanceClass(Visual->AnimationBlueprintClass.Get());
 			MeshAnimationTags.Remove(Mesh);
+		}
+		// An ABP has no pawn to read; units with a UMassUnitAnimInstance parent get their state pushed.
+		if (State)
+		{
+			if (UMassUnitAnimInstance* UnitAnim = Cast<UMassUnitAnimInstance>(Mesh->GetAnimInstance()))
+			{
+				const FMassUnitVelocityFragment* Velocity = EntityManager.GetFragmentDataPtr<FMassUnitVelocityFragment>(NativeHandle);
+				const FMassUnitTeamFragment* Team = EntityManager.GetFragmentDataPtr<FMassUnitTeamFragment>(NativeHandle);
+				UnitAnim->PushUnitState(
+					FMassUnitHandle(Entity),
+					*State,
+					*Visual,
+					EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(NativeHandle),
+					Team ? Team->TeamID : 0,
+					Velocity ? Velocity->Value.Size2D() : 0.0f);
+			}
 		}
 	}
 	Mesh->SetWorldTransform(Transform->GetTransform());
@@ -345,4 +421,43 @@ bool UUnitMeshPool::IsEntityValid(FMassUnitEntityHandle Entity) const
 {
 	return EntitySubsystem && Entity.IsValid()
 		&& EntitySubsystem->GetEntityManager().IsEntityValid(Entity.ToMassEntityHandle());
+}
+
+int32 UUnitMeshPool::StartRagdolls(const TArray<TPair<FMassUnitEntityHandle, FVector>>& Requests)
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	const int32 MaxRagdolls = Settings ? Settings->MaxActiveRagdolls : 0;
+	int32 Started = 0;
+	for (const TPair<FMassUnitEntityHandle, FVector>& Request : Requests)
+	{
+		if (RagdollMeshes.Num() >= MaxRagdolls)
+		{
+			break;
+		}
+		USkeletalMeshComponent* Mesh = EntityMeshMap.FindRef(Request.Key);
+		if (!Mesh || RagdollMeshes.Contains(Mesh) || !Mesh->GetPhysicsAsset())
+		{
+			continue;   // not in the near band, or no Physics Asset: the tumbling fling carries it
+		}
+		Mesh->SetCollisionProfileName(TEXT("Ragdoll"));
+		Mesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+		// Pool meshes are registered with NoCollision, so they may have no bodies yet: build them before simulating.
+		if (!Mesh->IsPhysicsStateCreated())
+		{
+			Mesh->RecreatePhysicsState();
+		}
+		Mesh->SetSimulatePhysics(true);
+		if (!Mesh->IsSimulatingPhysics())
+		{
+			// No bodies after all: restore the animated mesh and let the tumbling fling carry this corpse.
+			Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			Mesh->SetCollisionProfileName(UCollisionProfile::NoCollision_ProfileName);
+			continue;
+		}
+		Mesh->SetAllPhysicsLinearVelocity(Request.Value);
+		Mesh->WakeAllRigidBodies();
+		RagdollMeshes.Add(Mesh);
+		++Started;
+	}
+	return Started;
 }

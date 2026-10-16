@@ -13,6 +13,22 @@ class USceneComponent;
 class UUnitTemplate;
 class AActor;
 
+/** Layout of a spawner's units around the actor. Every pattern is deterministic for the same settings and seed. */
+UENUM(BlueprintType)
+enum class EMassUnitSpawnPattern : uint8
+{
+	/** Rows of Columns, UnitSpacing apart (the original layout). */
+	Grid,
+	/** Filled disc on a sunflower spiral; one unit per UnitSpacing square, no radius needed. */
+	Disc,
+	/** Evenly around a circle of PatternRadius (0 = just wide enough for UnitSpacing between units). */
+	Ring,
+	/** Centred line along the actor's right axis, UnitSpacing.Y apart. */
+	Line,
+	/** Uniform random in a disc of PatternRadius (0 = the Disc pattern's radius), from SpawnOptions.RandomSeed. */
+	Scatter
+};
+
 /**
  * Placeable, actor-light bootstrap for repeatable Mass Unit spawning.
  *
@@ -46,6 +62,19 @@ public:
 	/** Actor-local height added to every spawn point. Fifty centimeters centers the default engine cube on a floor. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Layout", meta = (ForceUnits = "cm"))
 	float SpawnHeight = 50.0f;
+
+	/** How units are laid out around the actor. Grid keeps the original Columns / UnitSpacing layout. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Layout")
+	EMassUnitSpawnPattern SpawnPattern = EMassUnitSpawnPattern::Grid;
+
+	/** Ring and Scatter radius. Zero sizes the pattern from UnitSpacing instead. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Layout", meta = (ClampMin = "0.0", ForceUnits = "cm",
+		EditCondition = "SpawnPattern == EMassUnitSpawnPattern::Ring || SpawnPattern == EMassUnitSpawnPattern::Scatter"))
+	float PatternRadius = 0.0f;
+
+	/** Team override and the random seed (Scatter positions, optional variant seeds). Defaults change nothing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Units")
+	FMassUnitBatchSpawnOptions SpawnOptions;
 
 	/** Create the grid automatically when gameplay begins. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Lifecycle")
@@ -82,6 +111,18 @@ public:
 	/** Activation, follow/repath, native damage, and optional GAS-effect controls for the whole group. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Engagement", meta = (EditCondition = "bEnableCrowdSimulation && bEnablePlayerEngagement", ShowOnlyInnerProperties))
 	FMassUnitPlayerEngagementConfig PlayerEngagementConfig;
+
+	/**
+	 * Opt-in group intelligence: alerts that recruit nearby crowds, morale that routs and rallies the group,
+	 * and a threat table for choosing between several players. Requires player engagement. Off by default,
+	 * so existing spawners behave exactly as before.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Collective", meta = (EditCondition = "bEnableCrowdSimulation && bEnablePlayerEngagement"))
+	bool bEnableCollectiveBehavior = false;
+
+	/** Alert, morale, threat, and debug settings for this spawner's crowd. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Collective", meta = (EditCondition = "bEnableCrowdSimulation && bEnablePlayerEngagement && bEnableCollectiveBehavior", ShowOnlyInnerProperties))
+	FMassUnitCrowdCollectiveConfig CollectiveConfig;
 
 	/** Prevent duplicate autonomous simulation on network clients. Standalone and listen-server quick starts still spawn normally. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit Spawner|Networking")
@@ -161,6 +202,36 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Spawner|Engagement")
 	FMassUnitHandle FindClosestSpawnedUnit(FVector WorldLocation, float MaxDistance, bool bUse3DDistance = false) const;
 
+	/** Actor-local spawn points for TotalUnits under the current pattern, spacing, radius and seed (SpawnHeight included). */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Spawner")
+	TArray<FVector> CalculateLocalSpawnOffsets(int32 TotalUnits) const;
+
+	/** Outer radius of the Disc / Ring / Scatter layouts for TotalUnits; zero for Grid and Line. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Spawner")
+	float GetPatternRadius(int32 TotalUnits) const;
+
+	/**
+	 * Same layouts without a spawner actor (stress director, tools). Local offsets around an origin facing +X;
+	 * Columns is used by Grid only, PatternRadius by Ring/Scatter only, RandomSeed by Scatter only.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Spawner")
+	static TArray<FVector> ComputePatternOffsets(
+		EMassUnitSpawnPattern Pattern,
+		int32 TotalUnits,
+		int32 InColumns,
+		FVector2D InUnitSpacing,
+		float InPatternRadius,
+		int32 RandomSeed,
+		float Height);
+
+	/** Outer radius ComputePatternOffsets uses for Disc / Ring / Scatter; zero for Grid and Line. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Spawner")
+	static float ComputePatternRadius(
+		EMassUnitSpawnPattern Pattern,
+		int32 TotalUnits,
+		FVector2D InUnitSpacing,
+		float InPatternRadius);
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -176,8 +247,8 @@ private:
 	UPROPERTY(Transient, VisibleInstanceOnly, Category = "Mass Unit Spawner|Runtime")
 	int32 CrowdGroupHandle = INDEX_NONE;
 
-	FVector CalculateLocalGridOffset(int32 UnitIndex, int32 TotalUnits) const;
 	bool CommandUnit(FMassUnitHandle UnitHandle, const FVector& Destination) const;
 	void DrawSpawnDebug(const FVector& Location) const;
+	void DrawPatternDebug(int32 TotalUnits) const;
 	void DrawCommandDebug(const FVector& Start, const FVector& Destination) const;
 };

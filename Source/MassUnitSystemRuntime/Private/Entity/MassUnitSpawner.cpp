@@ -72,22 +72,22 @@ TArray<FMassUnitHandle> AMassUnitSpawner::SpawnUnits()
 	}
 
 	const int32 RequestedCount = FMath::Max(0, UnitCount);
-	NewUnits.Reserve(RequestedCount);
-	for (int32 UnitIndex = 0; UnitIndex < RequestedCount; ++UnitIndex)
+	const TArray<FVector> LocalOffsets = CalculateLocalSpawnOffsets(RequestedCount);
+	TArray<FTransform> SpawnTransforms;
+	SpawnTransforms.Reserve(LocalOffsets.Num());
+	for (const FVector& LocalOffset : LocalOffsets)
 	{
-		const FVector SpawnLocation = GetActorTransform().TransformPosition(CalculateLocalGridOffset(UnitIndex, RequestedCount));
-		const FTransform SpawnTransform(GetActorQuat(), SpawnLocation, GetActorScale3D());
-		const FMassUnitHandle UnitHandle = UnitTemplate
-			? UnitManager->CreateUnitFromTemplate(UnitTemplate, SpawnTransform)
-			: UnitManager->CreateDefaultUnit(SpawnTransform);
-		if (!UnitManager->IsUnitValid(UnitHandle))
-		{
-			break;
-		}
-		SpawnedUnits.Add(UnitHandle);
-		NewUnits.Add(UnitHandle);
-		DrawSpawnDebug(SpawnLocation);
+		SpawnTransforms.Emplace(GetActorQuat(), GetActorTransform().TransformPosition(LocalOffset), GetActorScale3D());
 	}
+
+	// One batch call; a null template gives the asset-free default unit, as before.
+	NewUnits = UnitManager->CreateUnitsFromTemplate(UnitTemplate, SpawnTransforms, SpawnOptions);
+	SpawnedUnits.Append(NewUnits);
+	for (int32 Index = 0; Index < NewUnits.Num(); ++Index)
+	{
+		DrawSpawnDebug(SpawnTransforms[Index].GetLocation());
+	}
+	DrawPatternDebug(RequestedCount);
 
 	UE_LOG(LogMassUnitSystem, Log, TEXT("%s spawned %d Mass units"), *GetName(), NewUnits.Num());
 	return NewUnits;
@@ -232,6 +232,10 @@ int32 AMassUnitSpawner::StartCrowdSimulation()
 	if (CrowdGroupHandle != INDEX_NONE && bEnablePlayerEngagement)
 	{
 		CrowdSystem->ConfigureCrowdGroupEngagement(CrowdGroupHandle, PlayerEngagementConfig, true);
+		if (bEnableCollectiveBehavior)
+		{
+			CrowdSystem->ConfigureCrowdGroupCollectiveBehavior(CrowdGroupHandle, CollectiveConfig, true);
+		}
 		CrowdSystem->ForceCrowdGroupUpdate(CrowdGroupHandle);
 	}
 	return CrowdGroupHandle;
@@ -341,16 +345,120 @@ FMassUnitHandle AMassUnitSpawner::FindClosestSpawnedUnit(
 	return BestUnit;
 }
 
-FVector AMassUnitSpawner::CalculateLocalGridOffset(int32 UnitIndex, int32 TotalUnits) const
+namespace MassUnitSpawnerPatterns
 {
-	const int32 SafeColumns = FMath::Max(1, Columns);
-	const int32 RowCount = FMath::Max(1, FMath::DivideAndRoundUp(TotalUnits, SafeColumns));
-	const int32 RowIndex = UnitIndex / SafeColumns;
-	const int32 ColumnIndex = UnitIndex % SafeColumns;
-	const int32 UnitsInRow = FMath::Min(SafeColumns, TotalUnits - (RowIndex * SafeColumns));
-	const float CenteredRow = static_cast<float>(RowIndex) - (static_cast<float>(RowCount - 1) * 0.5f);
-	const float CenteredColumn = static_cast<float>(ColumnIndex) - (static_cast<float>(UnitsInRow - 1) * 0.5f);
-	return FVector(CenteredRow * UnitSpacing.X, CenteredColumn * UnitSpacing.Y, SpawnHeight);
+	/** Distance between neighbours in the round patterns: the tighter of the two grid spacings. */
+	float RoundSpacing(const FVector2D& UnitSpacing)
+	{
+		return FMath::Max(1.0f, FMath::Min(UnitSpacing.X, UnitSpacing.Y));
+	}
+
+	/** Sunflower (Vogel) spiral constant: one unit per Spacing^2 of disc area. */
+	float DiscScale(float Spacing)
+	{
+		return Spacing / FMath::Sqrt(UE_PI);
+	}
+
+	constexpr float GoldenAngle = 2.39996322972865332f; // pi * (3 - sqrt(5))
+}
+
+float AMassUnitSpawner::ComputePatternRadius(
+	EMassUnitSpawnPattern Pattern,
+	int32 TotalUnits,
+	FVector2D InUnitSpacing,
+	float InPatternRadius)
+{
+	using namespace MassUnitSpawnerPatterns;
+	const int32 Count = FMath::Max(0, TotalUnits);
+	const float Spacing = RoundSpacing(InUnitSpacing);
+	switch (Pattern)
+	{
+	case EMassUnitSpawnPattern::Disc:
+		return DiscScale(Spacing) * FMath::Sqrt(static_cast<float>(Count));
+	case EMassUnitSpawnPattern::Ring:
+		return InPatternRadius > 0.0f ? InPatternRadius : (Spacing * static_cast<float>(Count)) / (2.0f * UE_PI);
+	case EMassUnitSpawnPattern::Scatter:
+		return InPatternRadius > 0.0f ? InPatternRadius : DiscScale(Spacing) * FMath::Sqrt(static_cast<float>(Count));
+	default:
+		return 0.0f;
+	}
+}
+
+TArray<FVector> AMassUnitSpawner::ComputePatternOffsets(
+	EMassUnitSpawnPattern Pattern,
+	int32 TotalUnits,
+	int32 InColumns,
+	FVector2D InUnitSpacing,
+	float InPatternRadius,
+	int32 RandomSeed,
+	float Height)
+{
+	using namespace MassUnitSpawnerPatterns;
+	const int32 Count = FMath::Max(0, TotalUnits);
+	TArray<FVector> Offsets;
+	Offsets.Reserve(Count);
+
+	const float Radius = ComputePatternRadius(Pattern, Count, InUnitSpacing, InPatternRadius);
+	const float Scale = DiscScale(RoundSpacing(InUnitSpacing));
+	const int32 SafeColumns = FMath::Max(1, InColumns);
+	const int32 RowCount = FMath::Max(1, FMath::DivideAndRoundUp(Count, SafeColumns));
+	FRandomStream LayoutStream(RandomSeed);
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		FVector2D Local = FVector2D::ZeroVector;
+		switch (Pattern)
+		{
+		case EMassUnitSpawnPattern::Disc:
+		{
+			// +0.5 keeps the first unit off the exact centre and the spacing even near it.
+			const float Distance = Scale * FMath::Sqrt(static_cast<float>(Index) + 0.5f);
+			const float Angle = static_cast<float>(Index) * GoldenAngle;
+			Local = FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Distance;
+			break;
+		}
+		case EMassUnitSpawnPattern::Ring:
+		{
+			const float Angle = (2.0f * UE_PI * static_cast<float>(Index)) / static_cast<float>(Count);
+			Local = FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Radius;
+			break;
+		}
+		case EMassUnitSpawnPattern::Line:
+			Local = FVector2D(0.0f, (static_cast<float>(Index) - static_cast<float>(Count - 1) * 0.5f) * InUnitSpacing.Y);
+			break;
+		case EMassUnitSpawnPattern::Scatter:
+		{
+			// sqrt keeps the density uniform over the disc instead of bunching at the centre.
+			const float Distance = Radius * FMath::Sqrt(LayoutStream.FRand());
+			const float Angle = 2.0f * UE_PI * LayoutStream.FRand();
+			Local = FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Distance;
+			break;
+		}
+		case EMassUnitSpawnPattern::Grid:
+		default:
+		{
+			const int32 RowIndex = Index / SafeColumns;
+			const int32 ColumnIndex = Index % SafeColumns;
+			const int32 UnitsInRow = FMath::Min(SafeColumns, Count - (RowIndex * SafeColumns));
+			const float CenteredRow = static_cast<float>(RowIndex) - (static_cast<float>(RowCount - 1) * 0.5f);
+			const float CenteredColumn = static_cast<float>(ColumnIndex) - (static_cast<float>(UnitsInRow - 1) * 0.5f);
+			Local = FVector2D(CenteredRow * InUnitSpacing.X, CenteredColumn * InUnitSpacing.Y);
+			break;
+		}
+		}
+		Offsets.Add(FVector(Local.X, Local.Y, Height));
+	}
+	return Offsets;
+}
+
+float AMassUnitSpawner::GetPatternRadius(int32 TotalUnits) const
+{
+	return ComputePatternRadius(SpawnPattern, TotalUnits, UnitSpacing, PatternRadius);
+}
+
+TArray<FVector> AMassUnitSpawner::CalculateLocalSpawnOffsets(int32 TotalUnits) const
+{
+	return ComputePatternOffsets(
+		SpawnPattern, TotalUnits, Columns, UnitSpacing, PatternRadius, SpawnOptions.RandomSeed, SpawnHeight);
 }
 
 bool AMassUnitSpawner::CommandUnit(FMassUnitHandle UnitHandle, const FVector& Destination) const
@@ -375,6 +483,23 @@ void AMassUnitSpawner::DrawSpawnDebug(const FVector& Location) const
 	if (bEnableVisualDebug && GetWorld())
 	{
 		DrawDebugBox(GetWorld(), Location, FVector(45.0f), FColor::Cyan, false, DebugDuration, 0, 2.0f);
+	}
+#endif
+}
+
+void AMassUnitSpawner::DrawPatternDebug(int32 TotalUnits) const
+{
+#if ENABLE_DRAW_DEBUG
+	const float Radius = GetPatternRadius(TotalUnits);
+	if (bEnableVisualDebug && GetWorld() && Radius > 0.0f)
+	{
+		const FVector Centre = GetActorTransform().TransformPosition(FVector(0.0f, 0.0f, SpawnHeight));
+		DrawDebugCircle(GetWorld(), Centre, Radius, 64, FColor::Cyan, false, DebugDuration, 0, 3.0f,
+			GetActorRightVector(), GetActorForwardVector(), false);
+		DrawDebugString(GetWorld(), Centre + FVector(0.0f, 0.0f, 120.0f),
+			FString::Printf(TEXT("%s x%d  r=%.0f  seed=%d"), *UEnum::GetDisplayValueAsText(SpawnPattern).ToString(),
+				TotalUnits, Radius, SpawnOptions.RandomSeed),
+			nullptr, FColor::White, DebugDuration, true);
 	}
 #endif
 }

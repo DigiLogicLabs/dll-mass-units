@@ -41,6 +41,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
 	int32 GetSkeletalMeshCapacity() const { return MaxPoolSize; }
 
+	/**
+	 * Near-band kill ragdolls: each (dead unit, launch velocity) whose unit currently has a pooled skeletal mesh with a
+	 * Physics Asset becomes a simulating ragdoll, up to UMassUnitSystemSettings::MaxActiveRagdolls at once. The mesh
+	 * stays with its unit (and stops following the entity transform) until the unit is destroyed, then is reset and
+	 * returned to the pool. Units that do not qualify keep the cheap tumbling fling. Returns how many started.
+	 */
+	int32 StartRagdolls(const TArray<TPair<FMassUnitEntityHandle, FVector>>& Requests);
+
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Rendering|Diagnostics")
+	int32 GetActiveRagdollCount() const { return RagdollMeshes.Num(); }
+
 	USkeletalMeshComponent* GetMeshForUnitInternal(FMassUnitEntityHandle Entity);
 	bool TransitionToSkeletalInternal(FMassUnitEntityHandle Entity);
 	bool TransitionToVertexInternal(FMassUnitEntityHandle Entity);
@@ -62,6 +73,12 @@ private:
 	TMap<TObjectPtr<USkeletalMeshComponent>, FMassUnitEntityHandle> MeshEntityMap;
 
 	TMap<TObjectPtr<USkeletalMeshComponent>, FGameplayTag> MeshAnimationTags;
+
+	/** Attack serial each mesh last played, so every swing restarts the attack clip. */
+	TMap<TObjectPtr<USkeletalMeshComponent>, int32> MeshAttackSerials;
+
+	/** Pooled meshes currently simulating as ragdolls (not driven by their entity until released). */
+	TSet<TObjectPtr<USkeletalMeshComponent>> RagdollMeshes;
 
 	int32 MaxPoolSize = 100;
 	float UpdateInterval = 0.033f;

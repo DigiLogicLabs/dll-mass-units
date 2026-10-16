@@ -1,6 +1,7 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Core/MassUnitSubsystem.h"
+#include "Core/MassUnitStats.h"
 
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitSystemRuntime.h"
@@ -15,6 +16,7 @@
 #include "Navigation/FormationSystem.h"
 #include "Navigation/MassUnitNavigationSystem.h"
 #include "Visual/NiagaraUnitSystem.h"
+#include "Visual/CrowdInstanceRenderer.h"
 #include "Visual/UnitMeshPool.h"
 
 void UMassUnitSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -111,13 +113,30 @@ void UMassUnitSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
+DECLARE_CYCLE_STAT(TEXT("Subsystem Tick (total)"), STAT_MassUnit_SubsystemTick, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Skeletal Mesh Pool"), STAT_MassUnit_MeshPool, STATGROUP_MassUnitSystem);
+DECLARE_CYCLE_STAT(TEXT("Visual Update (Niagara / instances)"), STAT_MassUnit_VisualUpdate, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Units"), STAT_MassUnit_Units, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Airborne Units"), STAT_MassUnit_Airborne, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Skeletal Mesh Units"), STAT_MassUnit_SkeletalMeshes, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Ragdolls"), STAT_MassUnit_Ragdolls, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Render Instances"), STAT_MassUnit_RenderInstances, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Crowd Groups"), STAT_MassUnit_CrowdGroups, STATGROUP_MassUnitSystem);
+
 void UMassUnitSubsystem::Tick(float DeltaTime)
 {
+	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_SubsystemTick);
 	if (!UnitManager)
 	{
 		return;
 	}
 	UnitManager->PruneInvalidUnits();
+	if (const UWorld* World = GetWorld())
+	{
+		UnitManager->TickStatuses(World->GetTimeSeconds());
+	}
+	// Airborne units (knockback, kill flings): one sparse loop, free with nothing in the air.
+	UnitManager->TickLaunches(DeltaTime);
 
 	if (FormationSystem)
 	{
@@ -135,12 +154,29 @@ void UMassUnitSubsystem::Tick(float DeltaTime)
 	const TArray<FMassUnitEntityHandle>& Units = UnitManager->GetAllUnitsInternal();
 	if (MeshPool)
 	{
+		MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_MeshPool);
 		MeshPool->UpdateUnitMeshes(Units);
+		// After the update, so a kill promoted this frame can already ragdoll.
+		TArray<TPair<FMassUnitEntityHandle, FVector>> RagdollRequests = UnitManager->ConsumeRagdollRequests();
+		if (RagdollRequests.Num() > 0)
+		{
+			MeshPool->StartRagdolls(RagdollRequests);
+		}
 	}
 	if (NiagaraSystem)
 	{
+		MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_VisualUpdate);
 		NiagaraSystem->UpdateUnitVisuals(Units);
 	}
+
+	// Per-frame counters (stat MassUnitSystem + CSV "MassUnits"): what a stress run's numbers are read against.
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_Units, Units, Units.Num());
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_Airborne, Airborne, UnitManager->GetAirborneUnitCount());
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_SkeletalMeshes, SkeletalMeshUnits, MeshPool ? MeshPool->GetActiveSkeletalMeshCount() : 0);
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_Ragdolls, Ragdolls, MeshPool ? MeshPool->GetActiveRagdollCount() : 0);
+	const UCrowdInstanceRenderer* Renderer = NiagaraSystem ? NiagaraSystem->GetCrowdInstanceRenderer() : nullptr;
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_RenderInstances, RenderInstances, Renderer ? Renderer->GetLiveInstanceCount() : 0);
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_CrowdGroups, CrowdGroups, CrowdSystem ? CrowdSystem->GetCrowdGroupCount() : 0);
 }
 
 TStatId UMassUnitSubsystem::GetStatId() const

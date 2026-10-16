@@ -17,6 +17,8 @@ namespace UE::MassUnitSystem::Tags
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationAttack, "MassUnit.Animation.Attack");
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationDeath, "MassUnit.Animation.Death");
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationStun, "MassUnit.Animation.Stun");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_StatusStunned, "MassUnit.Status.Stunned");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_StatusLaunched, "MassUnit.Status.Launched");
 
 	FGameplayTag UnitTypeDefault() { return TAG_UnitTypeDefault.GetTag(); }
 	FGameplayTag UnitClassSoldier() { return TAG_UnitClassSoldier.GetTag(); }
@@ -29,4 +31,6 @@ namespace UE::MassUnitSystem::Tags
 	FGameplayTag AnimationAttack() { return TAG_AnimationAttack.GetTag(); }
 	FGameplayTag AnimationDeath() { return TAG_AnimationDeath.GetTag(); }
 	FGameplayTag AnimationStun() { return TAG_AnimationStun.GetTag(); }
+	FGameplayTag StatusStunned() { return TAG_StatusStunned.GetTag(); }
+	FGameplayTag StatusLaunched() { return TAG_StatusLaunched.GetTag(); }
 }

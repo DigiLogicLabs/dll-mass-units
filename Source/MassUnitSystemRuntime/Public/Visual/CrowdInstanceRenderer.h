@@ -19,11 +19,20 @@ class UStaticMesh;
  * a published contract: never renumber an existing channel, only append at the end and
  * bump NumCustomDataFloats.
  *
- * All 10 channels are written every update, but M_SwarmBot_Instanced currently READS only
- * 4-8 (team RGB, health, seed). Channels 0-2 and 9 - AnimationIndex, AnimationStartTime,
- * LODLevel and Speed - are populated and unread until the vertex-animation material lands;
- * they are the inputs it will consume, so keep writing them. TeamID (3) is an alternative
- * to the RGB channels for palette-indexing materials and is unread by design.
+ * All channels are written every update, but M_SwarmBot_Instanced READS only 4-8 (team RGB,
+ * health, seed). TeamID (3) is an alternative to the RGB channels for palette-indexing materials
+ * and is unread by design.
+ *
+ * Vertex-animation (AnimToTexture) materials read 1 and 10-12. The playback frame is:
+ *
+ *     Elapsed = Time - AnimationStartTime
+ *     Raw     = Elapsed * abs(ClipFramesPerSecond)
+ *     Local   = ClipFramesPerSecond > 0 ? fmod(Raw + RandomSeed * ClipFrameCount, ClipFrameCount)  // loop, de-synced
+ *                                       : min(Raw, ClipFrameCount - 1)                              // play once, hold
+ *     Frame   = ClipStartFrame + Local
+ *
+ * ClipFrameCount == 0 means the template has no clip table; such a material should show frame 0.
+ * Tools/Python/mass_unit_vat_material.py builds MF_MassUnitVATFrame, which implements exactly this.
  */
 namespace UE::MassUnitSystem::CrowdCustomData
 {
@@ -44,9 +53,15 @@ namespace UE::MassUnitSystem::CrowdCustomData
 	inline constexpr int32 RandomSeed = 8;
 	/** Horizontal speed in cm/s, so the material can cross-fade walk and run cycles. */
 	inline constexpr int32 Speed = 9;
+	/** First frame of the current clip inside the baked AnimToTexture texture. */
+	inline constexpr int32 ClipStartFrame = 10;
+	/** Frames in the current clip. Zero when the unit's template has no vertex-animation clip table. */
+	inline constexpr int32 ClipFrameCount = 11;
+	/** Playback rate in frames per second. Positive loops; negative plays once and holds the last frame. */
+	inline constexpr int32 ClipFramesPerSecond = 12;
 
 	/** Total floats reserved per instance. Append-only; see the channel contract above. */
-	inline constexpr int32 NumFloats = 10;
+	inline constexpr int32 NumFloats = 13;
 }
 
 /**
