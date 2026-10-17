@@ -14,6 +14,9 @@ tagged and `MassUnitSystem.uplugin` still reads `1.4.0`.
   `Gameplay/MassUnitBehaviorIntegration.h`. Migration: include `Gameplay/MassUnitBehaviorIntegration.h`.
 
 ### Added
+- `UUnitTemplate::BodyMaterialTag` (additive, `Unit Template|Tags`): what a unit's body is made of, for the host
+  project's material-keyed systems (gore splats, impact effects). The plugin never reads it; the tag vocabulary is the
+  project's. Empty = the host's default.
 - **Crowd rendering** — `UCrowdInstanceRenderer` replaces the instanced-mesh fallback: stable per-entity
   instance slots (per-instance data can no longer swap between units when one dies), one contiguous transform
   upload per mesh per update, custom-data uploads only when a value changed, tail-only compaction of recycled slots.
