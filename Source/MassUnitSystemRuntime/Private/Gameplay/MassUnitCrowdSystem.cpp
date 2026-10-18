@@ -1,6 +1,7 @@
 // Copyright Digi Logic Labs LLC. All Rights Reserved.
 
 #include "Gameplay/MassUnitCrowdSystem.h"
+#include "Gameplay/MassUnitBehaviorPreset.h"
 #include "Core/MassUnitStats.h"
 
 #include "AbilitySystemBlueprintLibrary.h"
@@ -61,13 +62,8 @@ void UMassUnitCrowdSystem::Deinitialize()
 		World->GetTimerManager().ClearTimer(UpdateTimer);
 	}
 
-	TArray<int32> GroupHandles;
-	Groups.GetKeys(GroupHandles);
-	for (const int32 GroupHandle : GroupHandles)
-	{
-		UnregisterCrowdGroup(GroupHandle, false);
-	}
-
+	// World teardown: the units go with the world, and the Mass entity manager may already be gone (touching fragments
+	// here asserted in MassEntitySubsystem.h, 2026-10-17), so groups are dropped without resetting unit fragments.
 	Groups.Reset();
 	UnitToGroup.Reset();
 	PendingSignals.Reset();
@@ -150,6 +146,65 @@ int32 UMassUnitCrowdSystem::RegisterCrowdGroup(
 	return Group.Handle;
 }
 
+int32 UMassUnitCrowdSystem::AddUnitsToCrowdGroup(int32 CrowdGroupHandle, const TArray<FMassUnitHandle>& UnitHandles)
+{
+	if (!World || !EntitySubsystem || !Groups.Contains(CrowdGroupHandle))
+	{
+		return 0;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const float CurrentTime = World->GetTimeSeconds();
+	int32 Added = 0;
+	for (const FMassUnitHandle& UnitHandle : UnitHandles)
+	{
+		const FMassUnitEntityHandle Entity = UnitHandle.EntityHandle;
+		if (!IsEntityValid(Entity))
+		{
+			continue;
+		}
+		const int32* CurrentGroup = UnitToGroup.Find(Entity);
+		if (CurrentGroup && *CurrentGroup == CrowdGroupHandle)
+		{
+			continue;
+		}
+		RemoveUnitFromPreviousGroup(Entity);
+		// Re-find after the removal: removing a unit can empty and remove another group (never this one, which we check).
+		FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+		FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle());
+		FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Entity.ToMassEntityHandle());
+		if (!Group || !Crowd || !State)
+		{
+			continue;
+		}
+		Crowd->Reset();
+		Crowd->bEnabled = true;
+		Crowd->bUse3DMovement = Group->Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
+		Crowd->bConformToNavmeshHeight = Group->bUseNavigation && !Crowd->bUse3DMovement && Group->Config.bConformToNavmeshHeight;
+		Crowd->NavigationHeightOffset = Group->Config.NavigationHeightOffset;
+		Crowd->GroupHandle = CrowdGroupHandle;
+		Crowd->SubgroupIndex = Group->Config.bEnableManagedSubgroups ? Group->Units.Num() / Group->Config.ManagedSubgroupSize : 0;
+		Crowd->BaseMoveSpeed = State->MoveSpeed;
+		Crowd->NextDecisionTime = CurrentTime;
+		Group->Units.AddUnique(Entity);
+		UnitToGroup.Add(Entity, CrowdGroupHandle);
+		++Added;
+	}
+	if (FCrowdGroup* Group = Groups.Find(CrowdGroupHandle); Group && Added > 0)
+	{
+		const int32 SubgroupCount = Group->Config.bEnableManagedSubgroups
+			? FMath::Max(1, FMath::DivideAndRoundUp(Group->Units.Num(), Group->Config.ManagedSubgroupSize))
+			: 1;
+		if (SubgroupCount != Group->SubgroupCount)
+		{
+			Group->SubgroupCount = SubgroupCount;
+			Group->NextSubgroupCueTimes.SetNumZeroed(SubgroupCount);
+			Group->Subgroups.SetNum(SubgroupCount);
+		}
+		StartTimerIfNeeded();
+	}
+	return Added;
+}
+
 bool UMassUnitCrowdSystem::UnregisterCrowdGroup(int32 CrowdGroupHandle, bool bStopUnits)
 {
 	FCrowdGroup Group;
@@ -180,7 +235,10 @@ bool UMassUnitCrowdSystem::SetCrowdGroupPaused(int32 CrowdGroupHandle, bool bPau
 	{
 		for (const FMassUnitEntityHandle Entity : Group->Units)
 		{
-			ClearMovement(Entity, true);
+			if (!IsUnitCommanded(Entity))
+			{
+				ClearMovement(Entity, true);
+			}
 		}
 	}
 	else if (!bPaused && EntitySubsystem && World)
@@ -221,6 +279,7 @@ bool UMassUnitCrowdSystem::ForceCrowdGroupUpdate(int32 CrowdGroupHandle)
 	const float CurrentTime = World->GetTimeSeconds();
 	LastStats = {};
 	UpdateGroupEngagements(CurrentTime);
+	UpdateGroupMotion(CurrentTime);
 	Group = Groups.Find(CrowdGroupHandle);
 	if (!Group)
 	{
@@ -266,6 +325,124 @@ bool UMassUnitCrowdSystem::ForceCrowdGroupUpdate(int32 CrowdGroupHandle)
 	PruneInvalidUnits();
 	RefreshPopulationStats(Entries);
 	return true;
+}
+
+bool UMassUnitCrowdSystem::SetCrowdGroupConfig(int32 CrowdGroupHandle, const FMassUnitCrowdConfig& Config, bool bUseNavigation, float AcceptanceRadius)
+{
+	FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group || !World || !EntitySubsystem)
+	{
+		return false;
+	}
+	FMassUnitCrowdConfig NewConfig = Config;
+	// The subgroup layout was assigned per unit at registration; keep it.
+	NewConfig.bEnableManagedSubgroups = Group->Config.bEnableManagedSubgroups;
+	NewConfig.ManagedSubgroupSize = Group->Config.ManagedSubgroupSize;
+	const bool bStyleChanged = NewConfig.MotionStyle != Group->Config.MotionStyle;
+	Group->Config = SanitizeConfig(NewConfig);
+	Group->bUseNavigation = bUseNavigation;
+	Group->AcceptanceRadius = FMath::Max(1.0f, AcceptanceRadius);
+	Group->Preset.Reset();
+	if (bStyleChanged)
+	{
+		Group->bMotionInitialized = false;
+	}
+	for (FCrowdSubgroupState& Subgroup : Group->Subgroups)
+	{
+		Subgroup.SharedPathPoints.Reset();
+		++Subgroup.Revision;
+	}
+
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const float CurrentTime = World->GetTimeSeconds();
+	for (const FMassUnitEntityHandle Entity : Group->Units)
+	{
+		if (!IsEntityValid(Entity))
+		{
+			continue;
+		}
+		FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle());
+		if (!Crowd || Crowd->bCommanded || Crowd->bStackDriven)
+		{
+			continue;
+		}
+		Crowd->MotionPhase = 0;
+		Crowd->NextDecisionTime = CurrentTime;
+		Crowd->SteeringDirection = FVector::ZeroVector;
+		if (!Group->bEngaged)
+		{
+			ClearMovement(Entity, true);   // drop the old style's ambient destination
+		}
+	}
+	ForceCrowdGroupUpdate(CrowdGroupHandle);
+	return true;
+}
+
+int32 UMassUnitCrowdSystem::RegisterCrowdGroupFromPreset(const TArray<FMassUnitHandle>& UnitHandles, FVector Center, UMassUnitBehaviorPreset* Preset)
+{
+	if (!Preset)
+	{
+		return INDEX_NONE;
+	}
+	const int32 Handle = RegisterCrowdGroup(UnitHandles, Center, Preset->Crowd, Preset->bUseNavigation, Preset->AcceptanceRadius);
+	if (Handle == INDEX_NONE)
+	{
+		return INDEX_NONE;
+	}
+	if (Preset->bEnableEngagement)
+	{
+		ConfigureCrowdGroupEngagement(Handle, Preset->Engagement, true);
+	}
+	if (Preset->bEnableCollectiveBehavior)
+	{
+		ConfigureCrowdGroupCollectiveBehavior(Handle, Preset->Collective, true);
+	}
+	if (FCrowdGroup* Group = Groups.Find(Handle))
+	{
+		Group->Preset = Preset;
+	}
+	return Handle;
+}
+
+bool UMassUnitCrowdSystem::ApplyCrowdGroupPreset(int32 CrowdGroupHandle, UMassUnitBehaviorPreset* Preset)
+{
+	FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group || !Preset)
+	{
+		return false;
+	}
+	// Engagement first: turning it off disengages before the new ambient config hands out destinations.
+	if (Preset->bEnableEngagement)
+	{
+		ConfigureCrowdGroupEngagement(CrowdGroupHandle, Preset->Engagement, true);
+	}
+	else if (Group->bEngagementEnabled)
+	{
+		ConfigureCrowdGroupEngagement(CrowdGroupHandle, Group->EngagementConfig, false);
+	}
+	if (Preset->bEnableCollectiveBehavior)
+	{
+		ConfigureCrowdGroupCollectiveBehavior(CrowdGroupHandle, Preset->Collective, true);
+	}
+	else if (Group->bCollectiveEnabled)
+	{
+		ConfigureCrowdGroupCollectiveBehavior(CrowdGroupHandle, Group->CollectiveConfig, false);
+	}
+	if (!SetCrowdGroupConfig(CrowdGroupHandle, Preset->Crowd, Preset->bUseNavigation, Preset->AcceptanceRadius))
+	{
+		return false;
+	}
+	if (FCrowdGroup* Applied = Groups.Find(CrowdGroupHandle))
+	{
+		Applied->Preset = Preset;
+	}
+	return true;
+}
+
+UMassUnitBehaviorPreset* UMassUnitCrowdSystem::GetCrowdGroupPreset(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	return Group ? Group->Preset.Get() : nullptr;
 }
 
 bool UMassUnitCrowdSystem::IsCrowdGroupRegistered(int32 CrowdGroupHandle) const
@@ -343,6 +520,7 @@ bool UMassUnitCrowdSystem::ConfigureCrowdGroupEngagement(
 	// Drop attack tokens with the engagement. Leaving them would make a re-engage start with a pool
 	// still occupied by units that are no longer attacking anything, throttling the first wave.
 	Group->AttackTokenExpiry.Reset();
+	Group->StackedAttackTokenExpiry.Reset();
 	if (!bEnableEngagement && Group->bEngaged)
 	{
 		return DeactivateCrowdGroupEngagement(CrowdGroupHandle, true);
@@ -394,7 +572,11 @@ bool UMassUnitCrowdSystem::ActivateCrowdGroupForActor(int32 CrowdGroupHandle, AA
 		Crowd->NextFollowUpdateTime = 0.0f;
 		Crowd->LastFollowTargetLocation = FVector::ZeroVector;
 		Crowd->SteeringDirection = FVector::ZeroVector;
-		State->MoveSpeed = Crowd->BaseMoveSpeed * Group->EngagementConfig.EngagedMoveSpeedMultiplier;
+		// Units under orders (UMassUnitCommandSystem) keep the order's speed.
+		if (!Crowd->bCommanded)
+		{
+			State->MoveSpeed = Crowd->BaseMoveSpeed * Group->EngagementConfig.EngagedMoveSpeedMultiplier;
+		}
 		if (State->CurrentState == EMassUnitState::Interacting)
 		{
 			State->CurrentState = EMassUnitState::Idle;
@@ -475,6 +657,11 @@ bool UMassUnitCrowdSystem::DeactivateCrowdGroupEngagement(int32 CrowdGroupHandle
 				Crowd->NextFollowUpdateTime = 0.0f;
 				Crowd->NextDecisionTime = bReturnToWander ? CurrentTime : TNumericLimits<float>::Max();
 				Crowd->SteeringDirection = FVector::ZeroVector;
+			}
+			// Units under orders (UMassUnitCommandSystem) keep their speed and their destination.
+			if (Crowd && Crowd->bCommanded)
+			{
+				continue;
 			}
 			if (Crowd && State && Crowd->BaseMoveSpeed > 0.0f)
 			{
@@ -619,6 +806,7 @@ void UMassUnitCrowdSystem::UpdateCrowds()
 	const float CurrentTime = World->GetTimeSeconds();
 	LastStats = {};
 	UpdateGroupEngagements(CurrentTime);
+	UpdateGroupMotion(CurrentTime);
 
 	TArray<FSpatialEntry> Entries;
 	TMap<FIntVector, TArray<int32>> Cells;
@@ -707,6 +895,10 @@ void UMassUnitCrowdSystem::BuildSpatialData(
 			FSpatialEntry& Entry = OutEntries.AddDefaulted_GetRef();
 			Entry.Entity = Entity;
 			Entry.Location = Transform->GetTransform().GetLocation();
+			if (const FMassUnitVelocityFragment* Velocity = EntityManager.GetFragmentDataPtr<FMassUnitVelocityFragment>(Entity.ToMassEntityHandle()))
+			{
+				Entry.Velocity = Velocity->Value;
+			}
 			Entry.GroupHandle = Pair.Key;
 			const int32 EntryIndex = OutEntries.Num() - 1;
 			OutEntryByEntity.Add(Entity, EntryIndex);
@@ -768,7 +960,7 @@ void UMassUnitCrowdSystem::RefreshPopulationStats(const TArray<FSpatialEntry>& E
 			// Held tokens are the authoritative attacker count. Reading it here rather than counting
 			// units in the Attacking state keeps the number correct even between crowd updates, when a
 			// unit may still be posed mid-swing without having been revisited.
-			LastStats.ActiveAttackers += Pair.Value.AttackTokenExpiry.Num();
+			LastStats.ActiveAttackers += Pair.Value.GetActiveAttackerCount();
 		}
 	}
 	if (!EntitySubsystem)
@@ -790,7 +982,7 @@ void UMassUnitCrowdSystem::RefreshPopulationStats(const TArray<FSpatialEntry>& E
 			++LastStats.EngagedUnits;
 			if (Group->EngagementConfig.MaxSimultaneousAttackers > 0
 				&& Group->EngagementConfig.bEnableAttacks
-				&& !Group->AttackTokenExpiry.Contains(Entry.Entity))
+				&& !Group->HoldsAttackToken(Entry.Entity))
 			{
 				const FMassUnitStateFragment* AttackState =
 					EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Entry.Entity.ToMassEntityHandle());
@@ -852,7 +1044,7 @@ void UMassUnitCrowdSystem::RefreshManagedSubgroupPaths(
 			Entry.Entity.ToMassEntityHandle());
 		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(
 			Entry.Entity.ToMassEntityHandle());
-		if (!Crowd || (State && State->CurrentState == EMassUnitState::Dead))
+		if (!Crowd || Crowd->bCommanded || (State && State->CurrentState == EMassUnitState::Dead))
 		{
 			continue;
 		}
@@ -1056,6 +1248,22 @@ void UMassUnitCrowdSystem::UpdateUnit(
 		&& Group.Config.bConformToNavmeshHeight;
 	Crowd->NavigationHeightOffset = Group.Config.NavigationHeightOffset;
 
+	// Under orders (UMassUnitCommandSystem): the crowd only keeps the unit apart from its neighbours. No wander, motion
+	// style, engagement, interaction or sleep touches its destination; releasing the unit hands it back.
+	if (Crowd->bCommanded)
+	{
+		if (Crowd->bSleeping)
+		{
+			Crowd->bSleeping = false;
+		}
+		if (bForceDecision || CurrentTime >= Crowd->NextSteeringUpdateTime)
+		{
+			Crowd->SteeringDirection = CalculateSeparation(Entry, Group, Entries, Cells);
+			Crowd->NextSteeringUpdateTime = CurrentTime + (UpdateInterval * LODMultiplier);
+		}
+		return;
+	}
+
 	const bool bHasEngagementTarget = Group.bEngaged && Group.TargetActor.IsValid();
 	const bool bShouldSleep = !bHasEngagementTarget
 		&& !ObserverLocations.IsEmpty()
@@ -1118,7 +1326,17 @@ void UMassUnitCrowdSystem::UpdateUnit(
 	if (bForceDecision || CurrentTime >= Crowd->NextSteeringUpdateTime)
 	{
 		Crowd->SteeringDirection = CalculateSeparation(Entry, Group, Entries, Cells);
+		if (Group.Config.MotionStyle == EMassUnitCrowdMotionStyle::Flock)
+		{
+			Crowd->SteeringDirection += CalculateFlocking(Entry, Group, Entries, Cells);
+		}
 		Crowd->NextSteeringUpdateTime = CurrentTime + (UpdateInterval * LODMultiplier);
+	}
+
+	if (Group.Config.MotionStyle != EMassUnitCrowdMotionStyle::Wander)
+	{
+		UpdateStyledUnit(Entry, Group, Entries, Cells, CurrentTime, LODMultiplier, bForceDecision);
+		return;
 	}
 
 	const bool bUsesManagedAmbientPath = Group.bUseNavigation
@@ -1291,6 +1509,7 @@ FMassUnitEntityHandle UMassUnitCrowdSystem::FindInteractionPartner(
 					const FMassUnitCrowdFragment* CandidateCrowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Candidate.Entity.ToMassEntityHandle());
 					const FMassUnitStateFragment* CandidateState = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Candidate.Entity.ToMassEntityHandle());
 					if (!CandidateCrowd || !CandidateState || !CandidateCrowd->bEnabled || CandidateCrowd->bSleeping
+						|| CandidateCrowd->bCommanded
 						|| CandidateCrowd->InteractionEndTime > CurrentTime
 						|| CandidateState->CurrentState == EMassUnitState::Dead
 						|| CandidateState->CurrentState == EMassUnitState::Stunned)
@@ -1534,7 +1753,8 @@ void UMassUnitCrowdSystem::ResetCrowdFragment(FMassUnitEntityHandle Entity, bool
 	const FMassEntityHandle NativeHandle = Entity.ToMassEntityHandle();
 	FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
 	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
-	if (Crowd && State && Crowd->BaseMoveSpeed > 0.0f)
+	const bool bCommanded = Crowd && Crowd->bCommanded;
+	if (Crowd && State && Crowd->BaseMoveSpeed > 0.0f && !bCommanded)
 	{
 		State->MoveSpeed = Crowd->BaseMoveSpeed;
 	}
@@ -1542,10 +1762,21 @@ void UMassUnitCrowdSystem::ResetCrowdFragment(FMassUnitEntityHandle Entity, bool
 	{
 		Crowd->Reset();
 	}
-	if (bStopUnit)
+	// A unit under orders keeps moving: its orders, not its crowd group, own its destination.
+	if (bStopUnit && !bCommanded)
 	{
 		ClearMovement(Entity, true);
 	}
+}
+
+bool UMassUnitCrowdSystem::IsUnitCommanded(FMassUnitEntityHandle Entity) const
+{
+	if (!EntitySubsystem || !IsEntityValid(Entity))
+	{
+		return false;
+	}
+	const FMassUnitCrowdFragment* Crowd = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle());
+	return Crowd && Crowd->bCommanded;
 }
 
 void UMassUnitCrowdSystem::RemoveUnitFromPreviousGroup(FMassUnitEntityHandle Entity)
@@ -1573,7 +1804,7 @@ void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 	// reporting its last holders through ActiveAttackers forever.
 	for (TPair<int32, FCrowdGroup>& Pair : Groups)
 	{
-		if (!Pair.Value.AttackTokenExpiry.IsEmpty())
+		if (Pair.Value.GetActiveAttackerCount() > 0)
 		{
 			PruneAttackTokens(Pair.Value, CurrentTime);
 		}
@@ -2053,7 +2284,9 @@ FVector UMassUnitCrowdSystem::CalculateGroupAnchor(const FCrowdGroup& Group) con
 		const FMassEntityHandle NativeHandle = Entity.ToMassEntityHandle();
 		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
 		const FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(NativeHandle);
-		if (!Transform || (State && State->CurrentState == EMassUnitState::Dead))
+		const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+		// Units under orders are elsewhere on purpose: they do not drag the group's anchor (flock leash, cues, rout).
+		if (!Transform || (State && State->CurrentState == EMassUnitState::Dead) || (Crowd && Crowd->bCommanded))
 		{
 			continue;
 		}
@@ -2065,11 +2298,14 @@ FVector UMassUnitCrowdSystem::CalculateGroupAnchor(const FCrowdGroup& Group) con
 
 void UMassUnitCrowdSystem::PruneAttackTokens(FCrowdGroup& Group, float CurrentTime)
 {
-	for (auto It = Group.AttackTokenExpiry.CreateIterator(); It; ++It)
+	for (TMap<FMassUnitEntityHandle, float>* Pool : { &Group.AttackTokenExpiry, &Group.StackedAttackTokenExpiry })
 	{
-		if (It->Value <= CurrentTime || !IsEntityValid(It->Key))
+		for (auto It = Pool->CreateIterator(); It; ++It)
 		{
-			It.RemoveCurrent();
+			if (It->Value <= CurrentTime || !IsEntityValid(It->Key))
+			{
+				It.RemoveCurrent();
+			}
 		}
 	}
 }
@@ -2104,12 +2340,29 @@ bool UMassUnitCrowdSystem::TryAcquireAttackToken(
 		*Existing = Expiry;
 		return true;
 	}
-	if (Group.AttackTokenExpiry.Num() >= MaxAttackers)
+	if (float* Existing = Group.StackedAttackTokenExpiry.Find(Entity))
 	{
-		return false;
+		*Existing = Expiry;
+		return true;
 	}
-	Group.AttackTokenExpiry.Add(Entity, Expiry);
-	return true;
+	if (Group.AttackTokenExpiry.Num() < MaxAttackers)
+	{
+		Group.AttackTokenExpiry.Add(Entity, Expiry);
+		return true;
+	}
+	// Multi-role piles: a unit on a pile (climbing, standing on a unit, or holding one up) that is in range may take a
+	// bonus token, so the pile keeps attacking while the ground ring holds the normal pool.
+	const int32 ExtraStacked = Group.EngagementConfig.ExtraAttackersWhileStacked;
+	if (ExtraStacked > 0 && Group.StackedAttackTokenExpiry.Num() < ExtraStacked && EntitySubsystem)
+	{
+		const FMassUnitCrowdFragment* Crowd = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle());
+		if (Crowd && Crowd->bStackDriven)
+		{
+			Group.StackedAttackTokenExpiry.Add(Entity, Expiry);
+			return true;
+		}
+	}
+	return false;
 }
 
 void UMassUnitCrowdSystem::RequestActorAttack(
@@ -2236,7 +2489,9 @@ float UMassUnitCrowdSystem::CalculateClosestLivingUnitDistanceSquared(
 		const FMassEntityHandle NativeHandle = Entity.ToMassEntityHandle();
 		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
 		const FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(NativeHandle);
-		if (!Transform || (State && State->CurrentState == EMassUnitState::Dead))
+		const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+		// A unit under orders near the target does not keep its group engaged.
+		if (!Transform || (State && State->CurrentState == EMassUnitState::Dead) || (Crowd && Crowd->bCommanded))
 		{
 			continue;
 		}
@@ -2400,8 +2655,368 @@ FMassUnitCrowdConfig UMassUnitCrowdSystem::SanitizeConfig(const FMassUnitCrowdCo
 	Result.SubgroupWanderRadiusScale = FMath::Clamp(Result.SubgroupWanderRadiusScale, 0.1f, 1.0f);
 	Result.SubgroupPathLookAheadDistance = FMath::Max(1.0f, Result.SubgroupPathLookAheadDistance);
 	Result.GroupCueCooldown = FMath::Max(0.0f, Result.GroupCueCooldown);
+	FMassUnitCrowdMotionConfig& Motion = Result.Motion;
+	Motion.WaypointInterval = FMath::Max(0.5f, Motion.WaypointInterval);
+	Motion.FlockNeighborRadius = FMath::Max(10.0f, Motion.FlockNeighborRadius);
+	Motion.AlignmentWeight = FMath::Clamp(Motion.AlignmentWeight, 0.0f, 4.0f);
+	Motion.CohesionWeight = FMath::Clamp(Motion.CohesionWeight, 0.0f, 4.0f);
+	Motion.FlockGoalSpeed = FMath::Max(1.0f, Motion.FlockGoalSpeed);
+	Motion.FlockGoalLeash = FMath::Max(50.0f, Motion.FlockGoalLeash);
+	Motion.SwarmRadius = FMath::Max(10.0f, Motion.SwarmRadius);
+	Motion.SwarmOrbitSpeed = FMath::Max(0.0f, Motion.SwarmOrbitSpeed);
+	Motion.SwarmDriftSpeed = FMath::Max(0.0f, Motion.SwarmDriftSpeed);
+	Motion.SwarmJitter = FMath::Clamp(Motion.SwarmJitter, 0.0f, 1.0f);
+	Motion.SwarmSpeedMultiplier = FMath::Clamp(Motion.SwarmSpeedMultiplier, 0.1f, 4.0f);
+	Motion.HiveRadius = FMath::Max(10.0f, Motion.HiveRadius);
+	Motion.ForageChance = FMath::Clamp(Motion.ForageChance, 0.0f, 1.0f);
+	Motion.ForageLingerTime = FMath::Max(0.0f, Motion.ForageLingerTime);
 	return Result;
 }
+
+// ================================================================================================
+// MOTION STYLES (Flock / Swarm / Hive) - ambient movement only; engagement is unchanged
+// ================================================================================================
+
+bool UMassUnitCrowdSystem::GetCrowdGroupMotionGoal(int32 CrowdGroupHandle, FVector& OutGoal) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group || !Group->bMotionInitialized
+		|| (Group->Config.MotionStyle != EMassUnitCrowdMotionStyle::Flock && Group->Config.MotionStyle != EMassUnitCrowdMotionStyle::Swarm))
+	{
+		return false;
+	}
+	OutGoal = Group->MotionGoal;
+	return true;
+}
+
+EMassUnitCrowdMotionStyle UMassUnitCrowdSystem::GetCrowdGroupMotionStyle(int32 CrowdGroupHandle) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	return Group ? Group->Config.MotionStyle : EMassUnitCrowdMotionStyle::Wander;
+}
+
+FVector UMassUnitCrowdSystem::PickMotionWaypoint(FCrowdGroup& Group) const
+{
+	FRandomStream Stream(HashCombine(static_cast<uint32>(Group.Config.RandomSeed), static_cast<uint32>(Group.Handle * 7919 + Group.WaypointSequence++)));
+	if (Group.Config.MovementMode == EMassUnitCrowdMovementMode::Free3D)
+	{
+		return Group.Center + Stream.VRand() * (FMath::Pow(Stream.FRand(), 1.0f / 3.0f) * Group.Config.WanderRadius);
+	}
+	const float Angle = Stream.FRandRange(0.0f, 2.0f * UE_PI);
+	const float Radius = FMath::Sqrt(Stream.FRand()) * Group.Config.WanderRadius;
+	return Group.Center + FVector(FMath::Cos(Angle) * Radius, FMath::Sin(Angle) * Radius, 0.0f);
+}
+
+void UMassUnitCrowdSystem::UpdateGroupMotion(float CurrentTime)
+{
+	for (TPair<int32, FCrowdGroup>& Pair : Groups)
+	{
+		FCrowdGroup& Group = Pair.Value;
+		const EMassUnitCrowdMotionStyle Style = Group.Config.MotionStyle;
+		if ((Style != EMassUnitCrowdMotionStyle::Flock && Style != EMassUnitCrowdMotionStyle::Swarm) || Group.bPaused)
+		{
+			continue;
+		}
+		if (Group.bEngaged)
+		{
+			Group.bMotionInitialized = false;   // re-seed from wherever the fight leaves the group
+			continue;
+		}
+		const FMassUnitCrowdMotionConfig& Motion = Group.Config.Motion;
+		const bool bPlanar = Group.Config.MovementMode == EMassUnitCrowdMovementMode::Planar2D;
+		const FVector Anchor = CalculateGroupAnchor(Group);
+		if (!Group.bMotionInitialized)
+		{
+			Group.MotionGoal = Anchor;
+			Group.MotionWaypoint = PickMotionWaypoint(Group);
+			Group.NextWaypointTime = CurrentTime + Motion.WaypointInterval;
+			Group.LastMotionTime = CurrentTime;
+			Group.bMotionInitialized = true;
+		}
+		const float DeltaTime = FMath::Clamp(CurrentTime - Group.LastMotionTime, 0.0f, 0.5f);
+		Group.LastMotionTime = CurrentTime;
+
+		const bool bFlock = Style == EMassUnitCrowdMotionStyle::Flock;
+		const float Speed = bFlock ? Motion.FlockGoalSpeed : Motion.SwarmDriftSpeed;
+		// A flock goal waits for the flock when it gets too far ahead, so the flock moves as one body.
+		const bool bWaitForFlock = bFlock && FVector::Dist2D(Group.MotionGoal, Anchor) > Motion.FlockGoalLeash;
+		if (!bWaitForFlock)
+		{
+			Group.MotionGoal = FMath::VInterpConstantTo(Group.MotionGoal, Group.MotionWaypoint, DeltaTime, Speed);
+		}
+		if (bPlanar)
+		{
+			Group.MotionGoal.Z = Anchor.Z;
+		}
+		const float ToWaypoint = bPlanar ? FVector::Dist2D(Group.MotionGoal, Group.MotionWaypoint) : FVector::Dist(Group.MotionGoal, Group.MotionWaypoint);
+		if (ToWaypoint < 50.0f || CurrentTime >= Group.NextWaypointTime)
+		{
+			Group.MotionWaypoint = PickMotionWaypoint(Group);
+			Group.NextWaypointTime = CurrentTime + Motion.WaypointInterval;
+		}
+#if ENABLE_DRAW_DEBUG
+		if (Group.Config.bEnableVisualDebug && World)
+		{
+			const float Life = UpdateInterval * 1.5f;
+			DrawDebugSphere(World, Group.MotionGoal + FVector(0, 0, 60), 40.0f, 10, FColor::Magenta, false, Life, 0, 2.0f);
+			DrawDebugLine(World, Group.MotionGoal + FVector(0, 0, 60), Group.MotionWaypoint + FVector(0, 0, 60), FColor::Orange, false, Life, 0, 1.5f);
+			if (!bFlock)
+			{
+				DrawDebugCircle(World, Group.MotionGoal + FVector(0, 0, 10), Motion.SwarmRadius, 32, FColor::Magenta, false, Life, 0, 1.0f,
+					FVector(1, 0, 0), FVector(0, 1, 0), false);
+			}
+			DrawDebugString(World, Group.MotionGoal + FVector(0, 0, 140), bFlock ? TEXT("FLOCK") : TEXT("SWARM"), nullptr,
+				bWaitForFlock ? FColor::Yellow : FColor::Magenta, Life, true);
+		}
+#endif
+	}
+}
+
+FVector UMassUnitCrowdSystem::CalculateFlocking(
+	const FSpatialEntry& Entry,
+	const FCrowdGroup& Group,
+	const TArray<FSpatialEntry>& Entries,
+	const TMap<FIntVector, TArray<int32>>& Cells)
+{
+	const FMassUnitCrowdMotionConfig& Motion = Group.Config.Motion;
+	if (Motion.AlignmentWeight <= 0.0f && Motion.CohesionWeight <= 0.0f)
+	{
+		return FVector::ZeroVector;
+	}
+	const float Radius = Motion.FlockNeighborRadius;
+	const float RadiusSquared = FMath::Square(Radius);
+	const int32 CellRange = FMath::Max(1, FMath::CeilToInt(Radius / SpatialCellSize));
+	const bool bUse3DMovement = Group.Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
+	const FIntVector CenterCell = ToSpatialCell(Entry.Location, bUse3DMovement);
+	const int32 MinCellZ = bUse3DMovement ? CenterCell.Z - CellRange : 0;
+	const int32 MaxCellZ = bUse3DMovement ? CenterCell.Z + CellRange : 0;
+	FVector HeadingSum = FVector::ZeroVector;
+	FVector CentreSum = FVector::ZeroVector;
+	int32 Neighbours = 0;
+	// Bounded: a dense flock stops counting after 24 neighbours (more adds cost, not behaviour).
+	constexpr int32 MaxNeighbours = 24;
+	for (int32 CellX = CenterCell.X - CellRange; CellX <= CenterCell.X + CellRange && Neighbours < MaxNeighbours; ++CellX)
+	{
+		for (int32 CellY = CenterCell.Y - CellRange; CellY <= CenterCell.Y + CellRange && Neighbours < MaxNeighbours; ++CellY)
+		{
+			for (int32 CellZ = MinCellZ; CellZ <= MaxCellZ && Neighbours < MaxNeighbours; ++CellZ)
+			{
+				const TArray<int32>* CellEntries = Cells.Find(FIntVector(CellX, CellY, CellZ));
+				if (!CellEntries)
+				{
+					continue;
+				}
+				for (const int32 EntryIndex : *CellEntries)
+				{
+					if (!Entries.IsValidIndex(EntryIndex) || Entries[EntryIndex].Entity == Entry.Entity || Entries[EntryIndex].GroupHandle != Group.Handle)
+					{
+						continue;
+					}
+					const FSpatialEntry& Other = Entries[EntryIndex];
+					const FVector Offset = Other.Location - Entry.Location;
+					if ((bUse3DMovement ? Offset.SizeSquared() : Offset.SizeSquared2D()) > RadiusSquared)
+					{
+						continue;
+					}
+					++LastStats.NeighborChecks;
+					HeadingSum += bUse3DMovement ? Other.Velocity.GetSafeNormal() : Other.Velocity.GetSafeNormal2D();
+					CentreSum += Other.Location;
+					if (++Neighbours >= MaxNeighbours)
+					{
+						break;
+					}
+				}
+			}
+		}
+	}
+	if (Neighbours == 0)
+	{
+		return FVector::ZeroVector;
+	}
+	const FVector Alignment = (HeadingSum / static_cast<float>(Neighbours)).GetClampedToMaxSize(1.0f);
+	const FVector ToCentre = CentreSum / static_cast<float>(Neighbours) - Entry.Location;
+	const FVector Cohesion = (bUse3DMovement ? ToCentre.GetSafeNormal() : ToCentre.GetSafeNormal2D())
+		* FMath::Clamp(ToCentre.Size() / Radius, 0.0f, 1.0f);
+	return Alignment * Motion.AlignmentWeight + Cohesion * Motion.CohesionWeight;
+}
+
+bool UMassUnitCrowdSystem::AssignMotionDestination(FMassUnitEntityHandle Entity, FCrowdGroup& Group, const FVector& Destination, bool bAllowNavmesh)
+{
+	if (!EntitySubsystem || !UnitManager)
+	{
+		return false;
+	}
+	const bool bNavmesh = bAllowNavmesh && Group.bUseNavigation && NavigationSystem
+		&& Group.Config.MovementMode == EMassUnitCrowdMovementMode::Planar2D;
+	const bool bAssigned = bNavmesh
+		? NavigationSystem->RequestPathInternal(Entity, Destination, Group.AcceptanceRadius)
+		: UnitManager->SetUnitDestination(FMassUnitHandle(Entity), Destination, Group.AcceptanceRadius);
+	if (bAssigned)
+	{
+		if (FMassUnitCrowdFragment* Crowd = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitCrowdFragment>(Entity.ToMassEntityHandle()))
+		{
+			Crowd->LastDestination = Destination;
+		}
+		++LastStats.DestinationsAssigned;
+	}
+	return bAssigned;
+}
+
+void UMassUnitCrowdSystem::UpdateStyledUnit(
+	const FSpatialEntry& Entry,
+	FCrowdGroup& Group,
+	const TArray<FSpatialEntry>& Entries,
+	const TMap<FIntVector, TArray<int32>>& Cells,
+	float CurrentTime,
+	float LODIntervalMultiplier,
+	bool bForceDecision)
+{
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle NativeHandle = Entry.Entity.ToMassEntityHandle();
+	FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(NativeHandle);
+	FMassUnitTargetFragment* Target = EntityManager.GetFragmentDataPtr<FMassUnitTargetFragment>(NativeHandle);
+	FMassUnitNavigationFragment* Navigation = EntityManager.GetFragmentDataPtr<FMassUnitNavigationFragment>(NativeHandle);
+	if (!Crowd || !State || !Target || !Navigation)
+	{
+		return;
+	}
+	const FMassUnitCrowdMotionConfig& Motion = Group.Config.Motion;
+	const bool bPlanar = Group.Config.MovementMode == EMassUnitCrowdMovementMode::Planar2D;
+	// Stable per-unit variety without bookkeeping (same scheme as corpse tumble seeds).
+	const float SeedA = FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.6180339887f);
+	const float SeedB = FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.7548776662f);
+	const float SeedC = FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.5698402910f);
+
+	switch (Group.Config.MotionStyle)
+	{
+	case EMassUnitCrowdMotionStyle::Flock:
+	{
+		if (!Group.bMotionInitialized)
+		{
+			return;
+		}
+		State->MoveSpeed = Crowd->BaseMoveSpeed * FMath::Lerp(0.9f, 1.1f, SeedA);
+		const bool bHasMovementTarget = Target->bHasTargetLocation || Navigation->bPathRequested || Navigation->bPathValid;
+		const float GoalMoved = bPlanar ? FVector::Dist2D(Crowd->LastDestination, Group.MotionGoal) : FVector::Dist(Crowd->LastDestination, Group.MotionGoal);
+		if (bForceDecision || !bHasMovementTarget || GoalMoved > 40.0f)
+		{
+			FVector Goal = Group.MotionGoal;
+			if (bPlanar)
+			{
+				Goal.Z = Entry.Location.Z;
+			}
+			AssignMotionDestination(Entry.Entity, Group, Goal, false);
+		}
+		return;
+	}
+	case EMassUnitCrowdMotionStyle::Swarm:
+	{
+		if (!Group.bMotionInitialized || (!bForceDecision && CurrentTime < Crowd->NextDecisionTime))
+		{
+			return;
+		}
+		Crowd->NextDecisionTime = CurrentTime + UpdateInterval * 2.0f * LODIntervalMultiplier;
+		const float Direction = SeedB < 0.5f ? -1.0f : 1.0f;
+		const float Angle = SeedA * 2.0f * UE_PI + Direction * FMath::DegreesToRadians(Motion.SwarmOrbitSpeed) * CurrentTime;
+		const float Radius = Motion.SwarmRadius * (0.3f + 0.7f * FMath::Sqrt(SeedC));
+		FVector Offset(FMath::Cos(Angle) * Radius, FMath::Sin(Angle) * Radius, 0.0f);
+		FRandomStream Jitter = MakeRandomStream(Entry.Entity, Group, Crowd->DecisionSequence++);
+		FVector Noise = Jitter.VRand() * (Motion.SwarmRadius * Motion.SwarmJitter);
+		if (bPlanar)
+		{
+			Noise.Z = 0.0f;
+		}
+		else
+		{
+			Offset.Z = FMath::Sin(Angle * 2.0f + SeedC * 6.0f) * Radius * 0.35f;
+		}
+		FVector Destination = Group.MotionGoal + Offset + Noise;
+		if (bPlanar)
+		{
+			Destination.Z = Entry.Location.Z;
+		}
+		State->MoveSpeed = Crowd->BaseMoveSpeed * Motion.SwarmSpeedMultiplier * FMath::Lerp(0.85f, 1.15f, SeedC);
+		AssignMotionDestination(Entry.Entity, Group, Destination, false);
+		return;
+	}
+	case EMassUnitCrowdMotionStyle::Hive:
+	{
+		const bool bHasMovementTarget = Target->bHasTargetLocation || Navigation->bPathRequested || Navigation->bPathValid;
+		if (bHasMovementTarget && !bForceDecision)
+		{
+			const FVector Destination = Target->bHasTargetLocation ? Target->TargetLocation : Navigation->DestinationLocation;
+			const float DistanceSquared = bPlanar ? FVector::DistSquared2D(Destination, Entry.Location) : FVector::DistSquared(Destination, Entry.Location);
+			const bool bReached = DistanceSquared <= FMath::Square(Group.AcceptanceRadius);
+			if (!bReached && CurrentTime < Crowd->NextDecisionTime)
+			{
+				return;   // still travelling
+			}
+			ClearMovement(Entry.Entity, true);
+			FRandomStream IdleStream = MakeRandomStream(Entry.Entity, Group, Crowd->DecisionSequence++);
+			if (Crowd->MotionPhase == 1)
+			{
+				Crowd->MotionPhase = 2;   // found something: linger, then head home
+				Crowd->NextDecisionTime = CurrentTime + Motion.ForageLingerTime * IdleStream.FRandRange(0.6f, 1.4f);
+			}
+			else
+			{
+				Crowd->NextDecisionTime = CurrentTime + IdleStream.FRandRange(Group.Config.MinIdleTime, Group.Config.MaxIdleTime) * LODIntervalMultiplier;
+			}
+			return;
+		}
+		if (!bForceDecision && CurrentTime < Crowd->NextDecisionTime)
+		{
+			return;
+		}
+		FRandomStream Stream = MakeRandomStream(Entry.Entity, Group, Crowd->DecisionSequence++);
+		const bool bForage = Crowd->MotionPhase == 0 && Stream.FRand() < Motion.ForageChance;
+		const float Angle = Stream.FRandRange(0.0f, 2.0f * UE_PI);
+		float Radius = 0.0f;
+		if (bForage)
+		{
+			const float Inner = Motion.HiveRadius * 1.5f;
+			const float Outer = FMath::Max(Group.Config.WanderRadius, Inner + 100.0f);
+			Radius = FMath::Lerp(Inner, Outer, FMath::Sqrt(Stream.FRand()));
+			Crowd->MotionPhase = 1;
+		}
+		else
+		{
+			Radius = FMath::Sqrt(Stream.FRand()) * Motion.HiveRadius;
+			Crowd->MotionPhase = 0;
+		}
+		FVector Destination = Group.Center + FVector(FMath::Cos(Angle) * Radius, FMath::Sin(Angle) * Radius, 0.0f);
+		if (bPlanar)
+		{
+			Destination.Z = Entry.Location.Z;
+		}
+		State->MoveSpeed = Crowd->BaseMoveSpeed * (bForage ? 1.0f : Stream.FRandRange(0.6f, 0.9f));
+		if (AssignMotionDestination(Entry.Entity, Group, Destination, true))
+		{
+			Crowd->NextDecisionTime = CurrentTime + Group.Config.MaxMoveTime * LODIntervalMultiplier;
+		}
+		else
+		{
+			Crowd->NextDecisionTime = CurrentTime + UpdateInterval * LODIntervalMultiplier;
+		}
+#if ENABLE_DRAW_DEBUG
+		if (Group.Config.bEnableVisualDebug && World)
+		{
+			DrawDebugCircle(World, Group.Center + FVector(0, 0, 10), Motion.HiveRadius, 32, FColor::Yellow, false, 1.0f, 0, 2.0f,
+				FVector(1, 0, 0), FVector(0, 1, 0), false);
+			if (bForage)
+			{
+				DrawDebugDirectionalArrow(World, Entry.Location, Destination, 50.0f, FColor::Green, false, 1.0f, 0, 1.0f);
+			}
+		}
+#endif
+		return;
+	}
+	default:
+		return;
+	}
+}
+
 
 FMassUnitPlayerEngagementConfig UMassUnitCrowdSystem::SanitizeEngagementConfig(
 	const FMassUnitPlayerEngagementConfig& Config)
@@ -2421,6 +3036,7 @@ FMassUnitPlayerEngagementConfig UMassUnitCrowdSystem::SanitizeEngagementConfig(
 	Result.DamageMultiplier = FMath::Max(0.0f, Result.DamageMultiplier);
 	Result.GameplayEffectLevel = FMath::Max(0.0f, Result.GameplayEffectLevel);
 	Result.MaxSimultaneousAttackers = FMath::Max(0, Result.MaxSimultaneousAttackers);
+	Result.ExtraAttackersWhileStacked = FMath::Max(0, Result.ExtraAttackersWhileStacked);
 	// Below 1.0 the standoff ring would sit inside attack range, so token-less units would attack anyway.
 	Result.StandoffDistanceMultiplier = FMath::Clamp(Result.StandoffDistanceMultiplier, 1.05f, 4.0f);
 	Result.EngagementSlotCount = FMath::Clamp(Result.EngagementSlotCount, 3, 64);
@@ -2962,6 +3578,7 @@ bool UMassUnitCrowdSystem::RetargetCrowdGroup(FCrowdGroup& Group, AActor* NewTar
 	Group.NextSharedPathUpdateTime = 0.0f;
 	// Tokens were granted against the old target's range; start the new fight with a clean pool.
 	Group.AttackTokenExpiry.Reset();
+	Group.StackedAttackTokenExpiry.Reset();
 	Group.LastTargetSwitchTime = CurrentTime;
 
 	if (EntitySubsystem)
@@ -2993,6 +3610,7 @@ void UMassUnitCrowdSystem::BeginRout(FCrowdGroup& Group, float CurrentTime)
 	Group.bRouting = true;
 	Group.RoutStartTime = CurrentTime;
 	Group.AttackTokenExpiry.Reset();
+	Group.StackedAttackTokenExpiry.Reset();
 	Group.PendingAlertActivationTime = -1.0f;
 	Group.PendingAlertTarget.Reset();
 
@@ -3061,6 +3679,15 @@ bool UMassUnitCrowdSystem::HasRoutReachedUnit(
 	{
 		return true;
 	}
+	// Attitude courage orders the rout: cowards (0) flee at once, the brave (1) at the end of the stagger.
+	if (EntitySubsystem)
+	{
+		const FMassUnitStateFragment* State = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitStateFragment>(Entity.ToMassEntityHandle());
+		if (State && State->Courage >= 0.0f)
+		{
+			return CurrentTime >= Group.RoutStartTime + FMath::Clamp(State->Courage, 0.0f, 1.0f) * StaggerTime;
+		}
+	}
 	uint32 Seed = HashCombine(::GetTypeHash(Group.Config.RandomSeed), GetTypeHash(Entity));
 	Seed = HashCombine(Seed, 0x0F1EE000u);
 	const float UnitOffset = (static_cast<float>(Seed % 1024u) / 1023.0f) * StaggerTime;
@@ -3091,6 +3718,7 @@ bool UMassUnitCrowdSystem::UpdateRoutingUnit(
 
 	// A fleeing unit never holds a token, so the pool is free the moment the group rallies.
 	Group.AttackTokenExpiry.Remove(Entry.Entity);
+	Group.StackedAttackTokenExpiry.Remove(Entry.Entity);
 	State->PendingAttackDamage = 0.0f;
 	if (State->CurrentState == EMassUnitState::Attacking)
 	{

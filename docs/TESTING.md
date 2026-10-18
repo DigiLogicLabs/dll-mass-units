@@ -22,6 +22,13 @@ dependency on any adopting game. Keep `-Package` short (260-character limit).
 | `MassUnitSystem.Spawner.BatchSpawn`, `MassUnitSystem.Spawner.PatternLayouts` | arriving (in-progress work) |
 | `MassUnitSystem.Crowd.CollectiveBehavior` | arriving |
 | `MassUnitSystem.Units.Launch`, `.StatusAndTags`, `.AnimationContract`, `.PresentationReplication` | arriving |
+| `MassUnitSystem.Units.Stacking` | arriving (2026-10-17, 9/9 suite green headless in MetalLegs) |
+| `MassUnitSystem.Crowd.MotionStyles` | arriving (2026-10-17, 10/10 suite green headless in MetalLegs) |
+| `MassUnitSystem.Crowd.StackedAttackers` | arriving (2026-10-17, 11/11 suite green headless in MetalLegs) |
+| `MassUnitSystem.Units.Commands` | arriving (2026-10-17, RTS R1; see changelog) |
+| `MassUnitSystem.Units.Looks` | arriving (2026-10-17, look profiles; see changelog) |
+| `MassUnitSystem.Crowd.BehaviorPresets` | arriving (2026-10-17; compiled in the standalone BuildPlugin, headless run pending) |
+| `MassUnitSystem.Units.Attitudes` | arriving (2026-10-17, attitude profiles; 25/25 suite green headless in MetalLegs) |
 
 Tests live in `Source/MassUnitSystemEditor/Private/Tests/`. Run in editor: *Tools → Session Frontend →
 Automation*, filter `MassUnitSystem`. Headless:

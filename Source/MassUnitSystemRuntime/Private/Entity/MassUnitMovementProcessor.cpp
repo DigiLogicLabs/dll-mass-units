@@ -3,7 +3,9 @@
 #include "Entity/MassUnitMovementProcessor.h"
 #include "Core/MassUnitStats.h"
 
+#include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
+#include "Entity/UnitTemplate.h"
 #include "Entity/MassUnitFragments.h"
 #include "MassEntityManager.h"
 #include "MassExecutionContext.h"
@@ -36,11 +38,23 @@ void UMassUnitMovementProcessor::ConfigureQueries(const TSharedRef<FMassEntityMa
 
 DECLARE_CYCLE_STAT(TEXT("Movement Processor"), STAT_MassUnit_MovementProcessor, STATGROUP_MassUnitSystem);
 
+namespace MassUnitMovement
+{
+	bool TemplateHasClip(const FMassUnitVisualFragment& Visual, const FGameplayTag& Tag)
+	{
+		const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+		return Template && Template->VertexAnimationClips.ContainsByPredicate(
+			[&Tag](const FMassUnitVATClip& Clip) { return Clip.AnimationTag == Tag; });
+	}
+}
+
 void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMassExecutionContext& Context)
 {
 	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_MovementProcessor);
 	const float DeltaTime = FMath::Min(Context.GetDeltaTimeSeconds(), 0.1f);
-	EntityQuery.ForEachEntityChunk(Context, [this, &EntityManager, DeltaTime](FMassExecutionContext& ChunkContext)
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	const float PresentationClimbSpeed = Settings ? Settings->PresentationClimbSpeed : 300.0f;
+	EntityQuery.ForEachEntityChunk(Context, [this, &EntityManager, DeltaTime, PresentationClimbSpeed](FMassExecutionContext& ChunkContext)
 	{
 		TArrayView<FMassUnitTransformFragment> Transforms = ChunkContext.GetMutableFragmentView<FMassUnitTransformFragment>();
 		TArrayView<FMassUnitVelocityFragment> Velocities = ChunkContext.GetMutableFragmentView<FMassUnitVelocityFragment>();
@@ -73,6 +87,14 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 				Visual.CurrentAnimation = State.CurrentState == EMassUnitState::Dead
 					? UE::MassUnitSystem::Tags::AnimationDeath()
 					: UE::MassUnitSystem::Tags::AnimationStun();
+				continue;
+			}
+
+			// Climbing or standing on another unit: UMassUnitStackSystem owns the position and the clip.
+			if (Crowd && Crowd->bStackDriven)
+			{
+				Velocity.Value = FVector::ZeroVector;
+				Force.Value = FVector::ZeroVector;
 				continue;
 			}
 
@@ -197,6 +219,35 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 				State.CurrentState = EMassUnitState::Idle;
 				State.StateTime = 0.0f;
 				Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
+			}
+
+			// Client puppet of a stacked unit (UMassUnitStackSystem::ApplyPresentationStackRole): ease to the replicated
+			// height instead of snapping per record, and show the pile pose. Never set on real units.
+			if (Crowd && Crowd->PresentationStackRole != 0)
+			{
+				if (bHasDestination)
+				{
+					FTransform& MutableTransform = Transform.GetMutableTransform();
+					FVector Location = MutableTransform.GetLocation();
+					Location.Z = FMath::FInterpConstantTo(Location.Z, Destination.Z, DeltaTime, PresentationClimbSpeed);
+					MutableTransform.SetLocation(Location);
+				}
+				if (State.CurrentState != EMassUnitState::Attacking && State.CurrentState != EMassUnitState::Interacting)
+				{
+					constexpr uint8 RoleClimbing = 1;
+					constexpr uint8 RoleHolding = 3;
+					if (Crowd->PresentationStackRole == RoleClimbing)
+					{
+						Visual.CurrentAnimation = MassUnitMovement::TemplateHasClip(Visual, UE::MassUnitSystem::Tags::AnimationClimb())
+							? UE::MassUnitSystem::Tags::AnimationClimb()
+							: UE::MassUnitSystem::Tags::AnimationRun();
+					}
+					else if (Crowd->PresentationStackRole == RoleHolding && State.CurrentState != EMassUnitState::Moving
+						&& MassUnitMovement::TemplateHasClip(Visual, UE::MassUnitSystem::Tags::AnimationHold()))
+					{
+						Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationHold();
+					}
+				}
 			}
 		}
 	});

@@ -13,6 +13,7 @@
 #include "MassEntityManager.h"
 #include "MassEntitySubsystem.h"
 #include "MassUnitCommonFragments.h"
+#include "Materials/MaterialInterface.h"
 
 namespace
 {
@@ -74,7 +75,14 @@ namespace
 		}
 		Result.StartFrame = static_cast<float>(Clip->StartFrame);
 		Result.FrameCount = static_cast<float>(FMath::Max(1, Clip->NumFrames));
-		Result.FramesPerSecond = Clip->bLoop ? Clip->FramesPerSecond : -Clip->FramesPerSecond;
+		// Attitude tempo on looping locomotion and idle only: one-shots keep the timing their impact delays match, and
+		// climb / hold / stun keep theirs (climb tempo must match the unscaled ClimbSpeed).
+		const bool bTempoClip = Clip->bLoop
+			&& (Visual.CurrentAnimation == Tags::AnimationIdle()
+				|| Visual.CurrentAnimation == Tags::AnimationWalk()
+				|| Visual.CurrentAnimation == Tags::AnimationRun());
+		const float Tempo = bTempoClip ? FMath::Max(0.05f, Visual.AnimationRate) : 1.0f;
+		Result.FramesPerSecond = Clip->bLoop ? Clip->FramesPerSecond * Tempo : -Clip->FramesPerSecond;
 		return Result;
 	}
 
@@ -96,7 +104,7 @@ void UCrowdInstanceRenderer::Initialize(UWorld* InWorld, UMassEntitySubsystem* I
 
 void UCrowdInstanceRenderer::Deinitialize()
 {
-	for (TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)
+	for (TPair<FCrowdBucketKey, FCrowdInstanceBucket>& Pair : Buckets)
 	{
 		if (Pair.Value.Component)
 		{
@@ -113,7 +121,7 @@ void UCrowdInstanceRenderer::Deinitialize()
 int32 UCrowdInstanceRenderer::GetLiveInstanceCount() const
 {
 	int32 Count = 0;
-	for (const TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)
+	for (const TPair<FCrowdBucketKey, FCrowdInstanceBucket>& Pair : Buckets)
 	{
 		Count += Pair.Value.LiveCount;
 	}
@@ -123,7 +131,7 @@ int32 UCrowdInstanceRenderer::GetLiveInstanceCount() const
 int32 UCrowdInstanceRenderer::GetAllocatedSlotCount() const
 {
 	int32 Count = 0;
-	for (const TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)
+	for (const TPair<FCrowdBucketKey, FCrowdInstanceBucket>& Pair : Buckets)
 	{
 		Count += Pair.Value.SlotToEntity.Num();
 	}
@@ -147,7 +155,7 @@ void UCrowdInstanceRenderer::UpdateInstances(
 	const FMassEntityManager& EntityManager = EntitySubsystem->GetEntityManager();
 	const float CurrentTime = World->GetTimeSeconds();
 
-	for (TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)
+	for (TPair<FCrowdBucketKey, FCrowdInstanceBucket>& Pair : Buckets)
 	{
 		FCrowdInstanceBucket& Bucket = Pair.Value;
 		Bucket.SlotTouched.Init(false, Bucket.SlotToEntity.Num());
@@ -172,19 +180,21 @@ void UCrowdInstanceRenderer::UpdateInstances(
 			continue;
 		}
 
-		UStaticMesh* Mesh = Visual->StaticMesh ? Visual->StaticMesh.Get() : FallbackMesh.Get();
-		if (!Mesh)
+		FCrowdBucketKey BodyKey;
+		BodyKey.Mesh = Visual->StaticMesh ? Visual->StaticMesh.Get() : FallbackMesh.Get();
+		BodyKey.Material = Visual->MaterialOverride;
+		if (!BodyKey.Mesh)
 		{
 			continue;
 		}
 
-		// A unit that changed mesh must give up its slot in the previous bucket first, otherwise it
+		// A unit that changed body must give up its slot in the previous bucket first, otherwise it
 		// would be drawn twice until the stale slot happened to be reclaimed.
-		if (const TObjectPtr<UStaticMesh>* PreviousMesh = EntityBucketMesh.Find(NativeHandle))
+		if (const FCrowdBucketKey* PreviousKey = EntityBucketMesh.Find(NativeHandle))
 		{
-			if (PreviousMesh->Get() != Mesh)
+			if (!(*PreviousKey == BodyKey))
 			{
-				if (FCrowdInstanceBucket* PreviousBucket = Buckets.Find(*PreviousMesh))
+				if (FCrowdInstanceBucket* PreviousBucket = Buckets.Find(*PreviousKey))
 				{
 					if (const int32* PreviousSlot = PreviousBucket->EntityToSlot.Find(NativeHandle))
 					{
@@ -194,7 +204,7 @@ void UCrowdInstanceRenderer::UpdateInstances(
 			}
 		}
 
-		FCrowdInstanceBucket* Bucket = FindOrAddBucket(Mesh);
+		FCrowdInstanceBucket* Bucket = FindOrAddBucket(BodyKey);
 		if (!Bucket)
 		{
 			continue;
@@ -204,9 +214,14 @@ void UCrowdInstanceRenderer::UpdateInstances(
 		{
 			continue;
 		}
-		EntityBucketMesh.Add(NativeHandle, Mesh);
+		EntityBucketMesh.Add(NativeHandle, BodyKey);
 
-		Bucket->SlotTransforms[Slot] = Transform->GetTransform();
+		FTransform InstanceTransform = Transform->GetTransform();
+		if (!FMath::IsNearlyEqual(Visual->LookScale, 1.0f))
+		{
+			InstanceTransform.SetScale3D(InstanceTransform.GetScale3D() * Visual->LookScale);
+		}
+		Bucket->SlotTransforms[Slot] = InstanceTransform;
 		Bucket->SlotTouched[Slot] = true;
 
 		const FMassUnitVelocityFragment* Velocity = EntityManager.GetFragmentDataPtr<FMassUnitVelocityFragment>(NativeHandle);
@@ -236,9 +251,40 @@ void UCrowdInstanceRenderer::UpdateInstances(
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipStartFrame, Clip.StartFrame);
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipFrameCount, Clip.FrameCount);
 		WriteCustomData(*Bucket, Slot, CrowdCustomData::ClipFramesPerSecond, Clip.FramesPerSecond);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::TintR, Visual->LookTint.R);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::TintG, Visual->LookTint.G);
+		WriteCustomData(*Bucket, Slot, CrowdCustomData::TintB, Visual->LookTint.B);
+
+		// Look parts: same transform and the same per-instance values as the body (parts are baked with the body's
+		// frame layout). A part that went away is released with every other untouched slot at the end of the pass.
+		// From here on `Bucket` may dangle: FindOrAddBucket below can add to (rehash) the bucket map. Copy what is needed first.
+		if (!Visual->LookParts.IsEmpty())
+		{
+			const float* BodyData = Bucket->SlotCustomData.GetData() + Slot * GetCustomDataFloatCount();
+			TArray<float, TInlineAllocator<CrowdCustomData::NumFloats>> Values;
+			Values.Append(BodyData, GetCustomDataFloatCount());
+			for (const FMassUnitLookPiece& Part : Visual->LookParts)
+			{
+				FCrowdBucketKey PartKey;
+				PartKey.Mesh = Part.Mesh;
+				PartKey.Material = Part.Material;
+				FCrowdInstanceBucket* PartBucket = PartKey.Mesh ? FindOrAddBucket(PartKey) : nullptr;
+				const int32 PartSlot = PartBucket ? AcquireSlot(*PartBucket, NativeHandle) : INDEX_NONE;
+				if (PartSlot == INDEX_NONE)
+				{
+					continue;
+				}
+				PartBucket->SlotTransforms[PartSlot] = InstanceTransform;
+				PartBucket->SlotTouched[PartSlot] = true;
+				for (int32 Channel = 0; Channel < Values.Num(); ++Channel)
+				{
+					WriteCustomData(*PartBucket, PartSlot, Channel, Values[Channel]);
+				}
+			}
+		}
 	}
 
-	for (TPair<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket>& Pair : Buckets)
+	for (TPair<FCrowdBucketKey, FCrowdInstanceBucket>& Pair : Buckets)
 	{
 		ReleaseUntouchedSlots(Pair.Value);
 		FlushBucket(Pair.Value);
@@ -246,29 +292,31 @@ void UCrowdInstanceRenderer::UpdateInstances(
 	}
 }
 
-FCrowdInstanceBucket* UCrowdInstanceRenderer::FindOrAddBucket(UStaticMesh* Mesh)
+FCrowdInstanceBucket* UCrowdInstanceRenderer::FindOrAddBucket(const FCrowdBucketKey& Key)
 {
-	if (!Mesh || !World)
+	if (!Key.Mesh || !World)
 	{
 		return nullptr;
 	}
-	if (FCrowdInstanceBucket* Existing = Buckets.Find(Mesh))
+	if (FCrowdInstanceBucket* Existing = Buckets.Find(Key))
 	{
 		return Existing;
 	}
-	UInstancedStaticMeshComponent* Component = CreateComponent(Mesh);
+	UInstancedStaticMeshComponent* Component = CreateComponent(Key);
 	if (!Component)
 	{
 		return nullptr;
 	}
-	FCrowdInstanceBucket& Bucket = Buckets.Add(Mesh);
+	// Buckets added while a pass is running (a new look part came into view) start with an empty touched set.
+	FCrowdInstanceBucket& Bucket = Buckets.Add(Key);
 	Bucket.Component = Component;
 	++TopologyRevision;
 	return &Bucket;
 }
 
-UInstancedStaticMeshComponent* UCrowdInstanceRenderer::CreateComponent(UStaticMesh* Mesh) const
+UInstancedStaticMeshComponent* UCrowdInstanceRenderer::CreateComponent(const FCrowdBucketKey& Key) const
 {
+	UStaticMesh* Mesh = Key.Mesh;
 	if (!World || !Mesh)
 	{
 		return nullptr;
@@ -287,6 +335,13 @@ UInstancedStaticMeshComponent* UCrowdInstanceRenderer::CreateComponent(UStaticMe
 	Component->SetCanEverAffectNavigation(false);
 	Component->SetNumCustomDataFloats(GetCustomDataFloatCount());
 	Component->SetStaticMesh(Mesh);
+	if (Key.Material)
+	{
+		for (int32 MaterialIndex = 0; MaterialIndex < FMath::Max(1, Mesh->GetStaticMaterials().Num()); ++MaterialIndex)
+		{
+			Component->SetMaterial(MaterialIndex, Key.Material);
+		}
+	}
 
 	// A crowd is the single worst case for shadow cost: thousands of small movable casters each
 	// re-rendered per cascade. Defaults here are off, and the settings expose the override.

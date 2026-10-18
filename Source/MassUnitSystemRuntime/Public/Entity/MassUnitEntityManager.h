@@ -6,6 +6,7 @@
 #include "Entity/MassEntityFallback.h"
 #include "Entity/MassUnitFragments.h"
 #include "GameplayTagContainer.h"
+#include "Gameplay/MassUnitAttitudeProfile.h"
 #include "MassArchetypeTypes.h"
 #include "MassEntityTypes.h"
 #include "MassUnitEntityManager.generated.h"
@@ -69,6 +70,17 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitBatchSpawnOptions
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Random")
 	bool bSeedVariants = false;
+
+	/**
+	 * Dress the whole batch in this look instead of the template's LookProfile (same minion, different look). An
+	 * adopter that replicates units must send the override too (clients spawn puppets from the template).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Look")
+	TObjectPtr<UMassUnitLookProfile> LookProfile = nullptr;
+
+	/** Give the whole batch this temperament instead of the template's AttitudeProfile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mass Unit|Attitude")
+	TObjectPtr<UMassUnitAttitudeProfile> AttitudeProfile = nullptr;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
@@ -262,6 +274,34 @@ public:
 	/** Overrides the variant seed - clients set the server's value on puppets so every machine draws the same unit. */
 	bool SetUnitVariantSeed(FMassUnitHandle UnitHandle, float Seed);
 
+	/**
+	 * Re-dresses a unit: rolls Profile from its variant seed (body variant, parts, scale, tint). Null = back to the
+	 * template's mesh as is. Setting the seed re-rolls the current profile too.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Look")
+	bool SetUnitLookProfile(FMassUnitHandle UnitHandle, UMassUnitLookProfile* Profile);
+
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Look")
+	UMassUnitLookProfile* GetUnitLookProfile(FMassUnitHandle UnitHandle) const;
+
+	/** What the unit is wearing: body, parts, scale and tint. False for invalid units. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Look")
+	bool GetUnitLook(FMassUnitHandle UnitHandle, FMassUnitRolledLook& OutLook) const;
+
+	/**
+	 * Gives a unit a temperament: rolls Profile from its variant seed and applies it to the template's speed and attack
+	 * cooldown, animation tempo, courage and climbing. Null = back to the template's values. Setting the seed re-rolls.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Attitude")
+	bool SetUnitAttitudeProfile(FMassUnitHandle UnitHandle, UMassUnitAttitudeProfile* Profile);
+
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Attitude")
+	UMassUnitAttitudeProfile* GetUnitAttitudeProfile(FMassUnitHandle UnitHandle) const;
+
+	/** The unit's rolled temperament (template values when it has no profile). False for invalid units. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Attitude")
+	bool GetUnitAttitude(FMassUnitHandle UnitHandle, FMassUnitRolledAttitude& OutAttitude) const;
+
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Status")
 	TArray<FMassUnitStatusEffect> GetUnitStatuses(FMassUnitHandle UnitHandle) const;
 
@@ -319,6 +359,14 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Launch")
 	int32 GetAirborneUnitCount() const { return ActiveLaunches.Num(); }
 
+	/**
+	 * Lowers an airborne unit's landing height to at most MaxLandZ, but only when its landing trace found no ground
+	 * (trace skipped by budget, tracing off, nothing hit): such a unit would otherwise land at its launch height. A real
+	 * ground hit (a step or slope above MaxLandZ) is kept. For units thrown from above the ground (falling off a pile).
+	 * Returns false when the unit is not airborne.
+	 */
+	bool CapLaunchLandingHeight(FMassUnitHandle UnitHandle, float MaxLandZ);
+
 	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Launch|Events")
 	FMassUnitLaunchedSignature OnUnitLaunched;
 
@@ -354,6 +402,26 @@ public:
 	const TMap<int32, TArray<FMassUnitEntityHandle>>& GetTeamMap() const { return TeamMap; }
 
 private:
+	/** Rolls Visual.LookProfile from Visual.VariantSeed into the visual fragment (or restores the template mesh). */
+	void ApplyLook(FMassUnitVisualFragment& Visual);
+
+	/**
+	 * Rolls Visual.AttitudeProfile from Visual.VariantSeed onto the template's values (speed, cooldown) and the attitude
+	 * fields. Crowd is optional: a grouped, uncommanded unit's crowd base speed follows the new speed; a commanded
+	 * unit's order keeps its speed and the command system's saved speed is updated instead.
+	 */
+	void ApplyAttitude(const FMassEntityHandle& Handle, FMassUnitStateFragment& State, FMassUnitVisualFragment& Visual, FMassUnitCrowdFragment* Crowd);
+
+	/**
+	 * Keeps a look or attitude profile and (look, non-dedicated) every asset it can roll referenced for the world's
+	 * lifetime. Mass fragments are not scanned by the garbage collector, so the fragments' pointers are not enough.
+	 */
+	void RetainProfile(UObject* Profile);
+
+	/** Profiles and their option assets in use by units (see RetainProfile). */
+	UPROPERTY(Transient)
+	TSet<TObjectPtr<UObject>> RetainedAssets;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UMassEntitySubsystem> EntitySubsystem = nullptr;
 
@@ -387,6 +455,8 @@ private:
 		float PitchRate = 0.0f;
 		float RollRate = 0.0f;
 		float LandZ = 0.0f;
+		/** The landing trace hit ground: LandZ is real, CapLaunchLandingHeight leaves it alone. */
+		bool bLandZFromTrace = false;
 		float FlightTime = 0.0f;
 		float SettleTime = 0.0f;
 		FQuat SettleFrom = FQuat::Identity;
@@ -405,7 +475,7 @@ private:
 	mutable uint64 LandingTraceFrame = 0;
 	mutable int32 LandingTracesThisFrame = 0;
 
-	float ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity) const;
+	float ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity, bool* bOutHitGround = nullptr) const;
 	void StartCorpseTumble(FActiveLaunch& Launch, const FMassEntityHandle& Handle) const;
 
 	void RemoveHandleFromIndexes(FMassUnitEntityHandle EntityHandle);

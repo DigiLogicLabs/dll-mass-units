@@ -9,6 +9,8 @@ DECLARE_CYCLE_STAT(TEXT("Prune Invalid Units"), STAT_MassUnit_PruneInvalidUnits,
 
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
+#include "Core/MassUnitSubsystem.h"
+#include "Gameplay/MassUnitCommandSystem.h"
 #include "Core/MassUnitSystemRuntime.h"
 #include "Entity/UnitTemplate.h"
 #include "Engine/SkeletalMesh.h"
@@ -207,6 +209,11 @@ FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitInternal(
 	Visual.VariantSeed = VariantStream
 		? VariantStream->FRand()
 		: FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.6180339887f);
+	// The look rolls from the seed, so a client puppet that later receives the server's seed re-rolls the same look.
+	Visual.LookProfile = Options && Options->LookProfile ? Options->LookProfile.Get() : Template->LookProfile.LoadSynchronous();
+	ApplyLook(Visual);
+	Visual.AttitudeProfile = Options && Options->AttitudeProfile ? Options->AttitudeProfile.Get() : Template->AttitudeProfile.LoadSynchronous();
+	ApplyAttitude(NativeHandle, State, Visual, nullptr);
 	Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
 	Visual.TargetAnimation = Visual.CurrentAnimation;
 	Visual.bUseSkeletalMesh = false;
@@ -1008,6 +1015,194 @@ bool UMassUnitEntityManager::SetUnitVariantSeed(FMassUnitHandle UnitHandle, floa
 		return false;
 	}
 	Visual->VariantSeed = FMath::Clamp(Seed, 0.0f, 1.0f);
+	ApplyLook(*Visual);
+	if (Visual->AttitudeProfile)
+	{
+		FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+		const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+		if (FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle))
+		{
+			ApplyAttitude(Handle, *State, *Visual, EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle));
+		}
+	}
+	return true;
+}
+
+void UMassUnitEntityManager::RetainProfile(UObject* Profile)
+{
+	if (!Profile || RetainedAssets.Contains(Profile))
+	{
+		return;
+	}
+	RetainedAssets.Add(Profile);
+	const UMassUnitLookProfile* Look = Cast<UMassUnitLookProfile>(Profile);
+	const UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	// A dedicated server draws nothing: it never loads look meshes or materials.
+	if (Look && !(World && World->GetNetMode() == NM_DedicatedServer))
+	{
+		TArray<UObject*> Assets;
+		Look->LoadAllOptionAssets(Assets);
+		for (UObject* Asset : Assets)
+		{
+			RetainedAssets.Add(Asset);
+		}
+	}
+}
+
+void UMassUnitEntityManager::ApplyAttitude(const FMassEntityHandle& Handle, FMassUnitStateFragment& State, FMassUnitVisualFragment& Visual, FMassUnitCrowdFragment* Crowd)
+{
+	RetainProfile(Visual.AttitudeProfile);
+	const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+	const FMassUnitRolledAttitude Attitude = Visual.AttitudeProfile ? Visual.AttitudeProfile->RollAttitude(Visual.VariantSeed) : FMassUnitRolledAttitude();
+	if (Template)
+	{
+		const float NewSpeed = FMath::Max(0.0f, Template->MoveSpeed) * Attitude.MoveSpeedMultiplier;
+		// Under orders: the order owns the live speed (matched formation speed); its saved speed takes the new value so
+		// release restores the new temperament.
+		UMassUnitCommandSystem* Commands = nullptr;
+		if (Crowd && Crowd->bCommanded)
+		{
+			const UMassUnitSubsystem* Subsystem = GetTypedOuter<UMassUnitSubsystem>();
+			Commands = Subsystem ? Subsystem->GetCommandSystem() : nullptr;
+		}
+		if (!(Commands && Commands->UpdateSavedMoveSpeed(FMassUnitHandle(Handle), NewSpeed)))
+		{
+			State.MoveSpeed = NewSpeed;
+		}
+		const float TemplateCooldown = FMath::Max(0.0f, Template->AttackCooldown);
+		State.AttackCooldown = TemplateCooldown;
+		// Never shorter than the swing's impact delay - unless the template itself is authored that way (left as is).
+		if (Visual.AttitudeProfile && TemplateCooldown > 0.0f && TemplateCooldown >= State.AttackImpactDelay + 0.05f)
+		{
+			State.AttackCooldown = FMath::Max(TemplateCooldown * Attitude.AttackCooldownMultiplier, State.AttackImpactDelay + 0.05f);
+		}
+	}
+	Visual.AnimationRate = Attitude.AnimationRate;
+	State.Courage = Attitude.Courage;
+	State.bAvoidsClimbing = !Attitude.bWillClimb;
+	// A grouped unit the crowd drives keeps its crowd speed in step (the crowd scales wander and chase from it).
+	if (Crowd && Crowd->BaseMoveSpeed > 0.0f && !Crowd->bCommanded)
+	{
+		Crowd->BaseMoveSpeed = State.MoveSpeed;
+	}
+}
+
+bool UMassUnitEntityManager::SetUnitAttitudeProfile(FMassUnitHandle UnitHandle, UMassUnitAttitudeProfile* Profile)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitVisualFragment* Visual = EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(Handle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle);
+	if (!Visual || !State)
+	{
+		return false;
+	}
+	Visual->AttitudeProfile = Profile;
+	ApplyAttitude(Handle, *State, *Visual, EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle));
+	return true;
+}
+
+UMassUnitAttitudeProfile* UMassUnitEntityManager::GetUnitAttitudeProfile(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return nullptr;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Visual ? Visual->AttitudeProfile.Get() : nullptr;
+}
+
+bool UMassUnitEntityManager::GetUnitAttitude(FMassUnitHandle UnitHandle, FMassUnitRolledAttitude& OutAttitude) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	OutAttitude = Visual->AttitudeProfile ? Visual->AttitudeProfile->RollAttitude(Visual->VariantSeed) : FMassUnitRolledAttitude();
+	return true;
+}
+
+void UMassUnitEntityManager::ApplyLook(FMassUnitVisualFragment& Visual)
+{
+	RetainProfile(Visual.LookProfile);
+	const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+	UStaticMesh* TemplateMesh = Template ? Template->StaticMesh.LoadSynchronous() : Visual.StaticMesh.Get();
+	const UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	const bool bDedicatedServer = World && World->GetNetMode() == NM_DedicatedServer;
+	// A dedicated server draws nothing: it keeps the profile (for queries) but never rolls or loads look assets.
+	if (!Visual.LookProfile || bDedicatedServer)
+	{
+		Visual.StaticMesh = TemplateMesh;
+		Visual.MaterialOverride = nullptr;
+		Visual.LookParts.Reset();
+		Visual.LookScale = 1.0f;
+		Visual.LookTint = FLinearColor::White;
+		return;
+	}
+	const FMassUnitRolledLook Look = Visual.LookProfile->RollLook(Visual.VariantSeed);
+	Visual.StaticMesh = Look.Body.Mesh ? Look.Body.Mesh.Get() : TemplateMesh;
+	Visual.MaterialOverride = Look.Body.Material;
+	Visual.LookParts = Look.Parts;
+	Visual.LookScale = Look.Scale;
+	Visual.LookTint = Look.Tint;
+}
+
+bool UMassUnitEntityManager::SetUnitLookProfile(FMassUnitHandle UnitHandle, UMassUnitLookProfile* Profile)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassUnitVisualFragment* Visual = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	Visual->LookProfile = Profile;
+	ApplyLook(*Visual);
+	return true;
+}
+
+UMassUnitLookProfile* UMassUnitEntityManager::GetUnitLookProfile(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return nullptr;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Visual ? Visual->LookProfile.Get() : nullptr;
+}
+
+bool UMassUnitEntityManager::GetUnitLook(FMassUnitHandle UnitHandle, FMassUnitRolledLook& OutLook) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	OutLook.Body.Mesh = Visual->StaticMesh;
+	OutLook.Body.Material = Visual->MaterialOverride;
+	OutLook.Parts = Visual->LookParts;
+	OutLook.Scale = Visual->LookScale;
+	OutLook.Tint = Visual->LookTint;
 	return true;
 }
 
@@ -1303,7 +1498,7 @@ bool UMassUnitEntityManager::LaunchUnit(FMassUnitHandle UnitHandle, FVector Velo
 	Launch->Bounces = 0;
 	Launch->bSettling = false;
 	Launch->bDead = bDead;
-	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity);
+	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity, &Launch->bLandZFromTrace);
 
 	if (bDead)
 	{
@@ -1337,13 +1532,31 @@ bool UMassUnitEntityManager::IsUnitAirborne(FMassUnitHandle UnitHandle) const
 	return UnitHandle.IsValid() && ActiveLaunches.Contains(UnitHandle.EntityHandle.ToMassEntityHandle());
 }
 
+bool UMassUnitEntityManager::CapLaunchLandingHeight(FMassUnitHandle UnitHandle, float MaxLandZ)
+{
+	FActiveLaunch* Launch = UnitHandle.IsValid() ? ActiveLaunches.Find(UnitHandle.EntityHandle.ToMassEntityHandle()) : nullptr;
+	if (!Launch)
+	{
+		return false;
+	}
+	if (!Launch->bLandZFromTrace)
+	{
+		Launch->LandZ = FMath::Min(Launch->LandZ, MaxLandZ);
+	}
+	return true;
+}
+
 TArray<TPair<FMassUnitEntityHandle, FVector>> UMassUnitEntityManager::ConsumeRagdollRequests()
 {
 	return MoveTemp(PendingRagdollRequests);
 }
 
-float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity) const
+float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity, bool* bOutHitGround) const
 {
+	if (bOutHitGround)
+	{
+		*bOutHitGround = false;
+	}
 	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
 	UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
 	if (!World || !Settings || !Settings->bTraceLandingGround)
@@ -1371,6 +1584,10 @@ float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVecto
 	if (World->LineTraceSingleByObjectType(Hit, Landing + FVector(0.0f, 0.0f, 200.0f), Landing - FVector(0.0f, 0.0f, 1500.0f),
 		StaticWorld, FCollisionQueryParams(SCENE_QUERY_STAT(MassUnitLaunchLanding), false)))
 	{
+		if (bOutHitGround)
+		{
+			*bOutHitGround = true;
+		}
 		return Hit.ImpactPoint.Z;
 	}
 	return Start.Z;

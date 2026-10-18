@@ -9,6 +9,7 @@ case-insensitive, so `prd.md` and a new `PRD.md` cannot coexist).
 | Install / quick start | [../README.md](../README.md), [quick-start.md](quick-start.md), [setup.md](setup.md) | Install, first 25 units, requirements |
 | Usage / API | [usage.md](usage.md), [api.md](api.md) | Creating and controlling units; public entry points |
 | Architecture | [architecture.md](architecture.md) | Ownership, subsystems, processors |
+| Unit composition | [unit_composition.md](unit_composition.md) | The goal (one minion, many purposes / looks / attitudes), the layers, the roadmap |
 | Decisions | [DECISIONS.md](DECISIONS.md) | Why things are the way they are (append-only log) |
 | Memory | [MEMORY.md](MEMORY.md) | Verified facts and traps the code doesn't make obvious |
 | Roadmap / status | [todo.md](todo.md) | Current status and validation backlog |

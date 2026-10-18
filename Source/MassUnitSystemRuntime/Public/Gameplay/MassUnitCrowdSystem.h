@@ -8,6 +8,7 @@
 
 class UMassEntitySubsystem;
 class UMassUnitNavigationSystem;
+class UMassUnitBehaviorPreset;
 class AActor;
 class UDamageType;
 class UGameplayEffect;
@@ -18,6 +19,87 @@ enum class EMassUnitCrowdMovementMode : uint8
 {
 	Planar2D UMETA(DisplayName = "Planar 2D (Navmesh Compatible)"),
 	Free3D UMETA(DisplayName = "Free 3D")
+};
+
+/**
+ * How a group's units move while it is NOT engaged on a target. Engagement (chasing and attacking a player) is the same
+ * for every style. Wander is the original behaviour and the default.
+ */
+UENUM(BlueprintType)
+enum class EMassUnitCrowdMotionStyle : uint8
+{
+	/** Each unit picks random destinations around the group centre (the original behaviour). */
+	Wander,
+	/** Boids: units steer by separation, alignment and cohesion with their neighbours and follow one roaming flock goal. */
+	Flock,
+	/** A tight buzzing cloud: units orbit a swarm centre that drifts around the group centre. */
+	Swarm,
+	/** A colony: units cluster at home (the group centre) and some forage out and come back. Pair with Player Proximity
+	 *  engagement around the centre for a hive that defends itself. */
+	Hive
+};
+
+/** Tuning for the non-Wander motion styles (FMassUnitCrowdConfig::MotionStyle). Only the selected style's values are used. */
+USTRUCT(BlueprintType)
+struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdMotionConfig
+{
+	GENERATED_BODY()
+
+	/** Seconds before the flock goal or swarm centre picks a new waypoint even if it has not reached the current one. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion", meta = (ClampMin = "0.5", ForceUnits = "s"))
+	float WaypointInterval = 6.0f;
+
+	/** Flock: neighbours within this distance count for alignment and cohesion. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Flock", meta = (ClampMin = "10.0", ForceUnits = "cm"))
+	float FlockNeighborRadius = 450.0f;
+
+	/** Flock: steer toward the average heading of neighbours. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Flock", meta = (ClampMin = "0.0", UIMax = "4.0"))
+	float AlignmentWeight = 0.9f;
+
+	/** Flock: steer toward the centre of neighbours. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Flock", meta = (ClampMin = "0.0", UIMax = "4.0"))
+	float CohesionWeight = 0.7f;
+
+	/** Flock: speed of the shared flock goal. Keep it at or below the units' move speed or the flock strings out. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Flock", meta = (ClampMin = "1.0", ForceUnits = "cm/s"))
+	float FlockGoalSpeed = 220.0f;
+
+	/** Flock: the goal waits when it gets this far ahead of the flock's centre, so stragglers keep up. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Flock", meta = (ClampMin = "50.0", ForceUnits = "cm"))
+	float FlockGoalLeash = 600.0f;
+
+	/** Swarm: radius of the cloud around the swarm centre. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Swarm", meta = (ClampMin = "10.0", ForceUnits = "cm"))
+	float SwarmRadius = 300.0f;
+
+	/** Swarm: how fast units circle the centre (half go each way). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Swarm", meta = (ClampMin = "0.0", UIMax = "360.0", ForceUnits = "deg/s"))
+	float SwarmOrbitSpeed = 90.0f;
+
+	/** Swarm: speed of the swarm centre as it drifts between waypoints. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Swarm", meta = (ClampMin = "0.0", ForceUnits = "cm/s"))
+	float SwarmDriftSpeed = 260.0f;
+
+	/** Swarm: random offset per decision, as a fraction of Swarm Radius. Higher reads as more agitated. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Swarm", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float SwarmJitter = 0.3f;
+
+	/** Swarm: speed multiplier on the units' template speed (swarms move urgently). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Swarm", meta = (ClampMin = "0.1", ClampMax = "4.0"))
+	float SwarmSpeedMultiplier = 1.25f;
+
+	/** Hive: units at home stay within this distance of the group centre. Foraging goes out to the group's Wander Radius. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Hive", meta = (ClampMin = "10.0", ForceUnits = "cm"))
+	float HiveRadius = 350.0f;
+
+	/** Hive: chance that a unit at home leaves on a forage trip at each decision. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Hive", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ForageChance = 0.35f;
+
+	/** Hive: seconds a forager lingers at its find before heading home. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Hive", meta = (ClampMin = "0.0", ForceUnits = "s"))
+	float ForageLingerTime = 2.0f;
 };
 
 /** Defines how an engagement-enabled group acquires its first player target. */
@@ -58,6 +140,18 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdConfig
 	/** Planar mode is appropriate for ground crowds and navmesh. Free 3D supports flying, swimming, and 2.5D/3D groups. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement")
 	EMassUnitCrowdMovementMode MovementMode = EMassUnitCrowdMovementMode::Planar2D;
+
+	/**
+	 * How units move while the group is not engaged: Wander (random destinations, the default), Flock (boids), Swarm
+	 * (orbiting cloud) or Hive (home cluster + foragers). Flock and Swarm steer straight at their goals without per-unit
+	 * navmesh paths, so use them in open areas; Hive foraging uses navigation when the group does.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Motion")
+	EMassUnitCrowdMotionStyle MotionStyle = EMassUnitCrowdMotionStyle::Wander;
+
+	/** Tuning for the selected Motion Style. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Motion", meta = (EditCondition = "MotionStyle != EMassUnitCrowdMotionStyle::Wander"))
+	FMassUnitCrowdMotionConfig Motion;
 
 	/** Follow native navmesh elevation in Planar2D navigation mode without per-unit ground traces. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Planar2D"))
@@ -267,6 +361,15 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitPlayerEngagementConfig
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks", ClampMin = "0", UIMin = "0", UIMax = "24"))
 	int32 MaxSimultaneousAttackers = 0;
+
+	/**
+	 * Extra attack tokens only units on a pile can take (climbers, and the ground units holding them up -
+	 * FMassUnitCrowdFragment::bStackDriven). Without them the ground ring holds every token and a climber that reaches the
+	 * target never swings. Counted on top of MaxSimultaneousAttackers; 0 = stacked units share the normal pool. Only
+	 * matters for templates that stack (UUnitTemplate::Stacking), so it changes nothing for other groups.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && MaxSimultaneousAttackers > 0", ClampMin = "0", UIMax = "24"))
+	int32 ExtraAttackersWhileStacked = 8;
 
 	/** Where token-less units wait, as a multiple of attack range. Must exceed one or they attack anyway. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && MaxSimultaneousAttackers > 0", ClampMin = "1.05", ClampMax = "4.0"))
@@ -636,6 +739,14 @@ public:
 		bool bUseNavigation = false,
 		float AcceptanceRadius = 50.0f);
 
+	/**
+	 * Adds units to an existing group without touching its current members (refills, reinforcements, churn). New units
+	 * get the group's config, engagement and motion on their next decision; units already in another group move over.
+	 * Returns how many joined.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd")
+	int32 AddUnitsToCrowdGroup(int32 CrowdGroupHandle, const TArray<FMassUnitHandle>& UnitHandles);
+
 	/** Removes a crowd group. Optionally clears movement and restores each unit's original speed. */
 	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd")
 	bool UnregisterCrowdGroup(int32 CrowdGroupHandle, bool bStopUnits = true);
@@ -651,6 +762,29 @@ public:
 	/** Immediately gives active units in one group a fresh decision, bypassing the normal per-update budget. */
 	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd")
 	bool ForceCrowdGroupUpdate(int32 CrowdGroupHandle);
+
+	/**
+	 * Changes a live group's crowd config (motion style, wander, avoidance, interactions, LOD) and navigation. The
+	 * managed-subgroup layout (bEnableManagedSubgroups, ManagedSubgroupSize) is kept from registration. Units drop their
+	 * ambient destinations and decide again under the new config; units under orders or on a pile are left alone.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd")
+	bool SetCrowdGroupConfig(int32 CrowdGroupHandle, const FMassUnitCrowdConfig& Config, bool bUseNavigation, float AcceptanceRadius = 50.0f);
+
+	/** Registers a group with a behaviour preset's crowd config, engagement and collective behaviour in one call. */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Presets", meta = (ReturnDisplayName = "Crowd Group Handle"))
+	int32 RegisterCrowdGroupFromPreset(const TArray<FMassUnitHandle>& UnitHandles, FVector Center, UMassUnitBehaviorPreset* Preset);
+
+	/**
+	 * Swaps a live group's whole temperament to Preset: crowd config (SetCrowdGroupConfig), engagement (an engaged group
+	 * whose new preset has engagement off disengages) and collective behaviour. Same handle, same units.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Crowd|Presets")
+	bool ApplyCrowdGroupPreset(int32 CrowdGroupHandle, UMassUnitBehaviorPreset* Preset);
+
+	/** The preset last registered or applied on the group (null when it was configured by hand). */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Presets")
+	UMassUnitBehaviorPreset* GetCrowdGroupPreset(int32 CrowdGroupHandle) const;
 
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd")
 	bool IsCrowdGroupRegistered(int32 CrowdGroupHandle) const;
@@ -706,6 +840,17 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Diagnostics")
 	FMassUnitCrowdStats GetCrowdStats() const { return LastStats; }
+
+	/**
+	 * The point a Flock group follows or a Swarm group orbits (false for other styles, an unknown group, or before the
+	 * first update). Engaged groups keep their last goal.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Motion")
+	bool GetCrowdGroupMotionGoal(int32 CrowdGroupHandle, FVector& OutGoal) const;
+
+	/** The group's motion style, or Wander for an unknown group. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Motion")
+	EMassUnitCrowdMotionStyle GetCrowdGroupMotionStyle(int32 CrowdGroupHandle) const;
 
 	// ====================================================================================
 	// COLLECTIVE BEHAVIOR (opt-in) - alerts, morale/rout, threat targeting. See
@@ -846,6 +991,8 @@ private:
 		int32 Handle = INDEX_NONE;
 		FVector Center = FVector::ZeroVector;
 		FMassUnitCrowdConfig Config;
+		/** Preset last registered or applied (query only; its values are copied into the configs). */
+		TWeakObjectPtr<UMassUnitBehaviorPreset> Preset;
 		TArray<FMassUnitEntityHandle> Units;
 		int32 SubgroupCount = 1;
 		TArray<float> NextSubgroupCueTimes;
@@ -873,6 +1020,14 @@ private:
 		 * mid-attack cannot leak a token and starve the pool. Pruned lazily on acquisition.
 		 */
 		TMap<FMassUnitEntityHandle, float> AttackTokenExpiry;
+		/** Bonus tokens held by stack-driven units (ExtraAttackersWhileStacked), same expiry rules. */
+		TMap<FMassUnitEntityHandle, float> StackedAttackTokenExpiry;
+
+		int32 GetActiveAttackerCount() const { return AttackTokenExpiry.Num() + StackedAttackTokenExpiry.Num(); }
+		bool HoldsAttackToken(const FMassUnitEntityHandle& Entity) const
+		{
+			return AttackTokenExpiry.Contains(Entity) || StackedAttackTokenExpiry.Contains(Entity);
+		}
 
 		// -------- Collective behavior (inert unless bCollectiveEnabled) --------
 		bool bCollectiveEnabled = false;
@@ -908,12 +1063,22 @@ private:
 
 		TMap<TWeakObjectPtr<AActor>, float> Threat;
 		float LastTargetSwitchTime = -1000.0f;
+
+		// -------- Motion styles (Flock / Swarm) --------
+		FVector MotionGoal = FVector::ZeroVector;
+		FVector MotionWaypoint = FVector::ZeroVector;
+		float NextWaypointTime = 0.0f;
+		float LastMotionTime = -1.0f;
+		int32 WaypointSequence = 0;
+		bool bMotionInitialized = false;
 	};
 
 	struct FSpatialEntry
 	{
 		FMassUnitEntityHandle Entity;
 		FVector Location = FVector::ZeroVector;
+		/** Current velocity (Flock alignment). */
+		FVector Velocity = FVector::ZeroVector;
 		int32 GroupHandle = INDEX_NONE;
 	};
 
@@ -938,6 +1103,16 @@ public:
 	 * last group is removed, because the update timer stops when idle.
 	 */
 	int32 GetCrowdGroupCount() const { return Groups.Num(); }
+
+	/** Every registered group handle (C++ services that walk groups, e.g. the stack system's pile planner). */
+	void GetCrowdGroupHandles(TArray<int32>& OutHandles) const { Groups.GetKeys(OutHandles); }
+
+	/** The group's unit list, or null for an unknown group. Includes dead units until they are pruned. */
+	const TArray<FMassUnitEntityHandle>* GetCrowdGroupUnitsInternal(int32 CrowdGroupHandle) const
+	{
+		const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+		return Group ? &Group->Units : nullptr;
+	}
 
 private:
 	TMap<FMassUnitEntityHandle, int32> UnitToGroup;
@@ -1040,8 +1215,32 @@ private:
 	void ClearMovement(FMassUnitEntityHandle Entity, bool bSetIdle) const;
 	void SetUnitSleeping(FMassUnitEntityHandle Entity, bool bSleeping, float CurrentTime) const;
 	void ResetCrowdFragment(FMassUnitEntityHandle Entity, bool bStopUnit) const;
+	/** True when UMassUnitCommandSystem owns the unit (FMassUnitCrowdFragment::bCommanded). */
+	bool IsUnitCommanded(FMassUnitEntityHandle Entity) const;
 	void RemoveUnitFromPreviousGroup(FMassUnitEntityHandle Entity);
 	void UpdateGroupEngagements(float CurrentTime);
+
+	// -------- Motion styles --------
+	/** Once per update: moves each idle Flock / Swarm group's goal toward its waypoint and picks new waypoints. */
+	void UpdateGroupMotion(float CurrentTime);
+	/** Ambient decision for a unit of a non-Wander group. Separation is already in the unit's steering. */
+	void UpdateStyledUnit(
+		const FSpatialEntry& Entry,
+		FCrowdGroup& Group,
+		const TArray<FSpatialEntry>& Entries,
+		const TMap<FIntVector, TArray<int32>>& Cells,
+		float CurrentTime,
+		float LODIntervalMultiplier,
+		bool bForceDecision);
+	/** Flock alignment + cohesion (weighted) from same-group neighbours in the spatial hash. */
+	FVector CalculateFlocking(
+		const FSpatialEntry& Entry,
+		const FCrowdGroup& Group,
+		const TArray<FSpatialEntry>& Entries,
+		const TMap<FIntVector, TArray<int32>>& Cells);
+	/** Direct (or, when allowed and the group navigates, navmesh) destination for a styled unit. */
+	bool AssignMotionDestination(FMassUnitEntityHandle Entity, FCrowdGroup& Group, const FVector& Destination, bool bAllowNavmesh);
+	FVector PickMotionWaypoint(FCrowdGroup& Group) const;
 	bool UpdateEngagedUnit(const FSpatialEntry& Entry, FCrowdGroup& Group, float CurrentTime, bool bForceDecision);
 	bool RefreshSharedNavigationPath(FCrowdGroup& Group, float CurrentTime, bool bForceRefresh = false);
 	FVector CalculateSharedPathDestination(const FSpatialEntry& Entry, const FCrowdGroup& Group) const;

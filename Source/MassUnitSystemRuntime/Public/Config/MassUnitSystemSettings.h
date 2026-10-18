@@ -186,6 +186,82 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Launch", meta = (ClampMin = "0"))
 	int32 MaxActiveRagdolls = 12;
 
+	/**
+	 * Master switch for stacking and piling (UMassUnitStackSystem). Templates still opt in one by one
+	 * (UUnitTemplate::Stacking.bCanStack), so with no stack-capable template this costs nothing.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking")
+	bool bEnableStacking = true;
+
+	/** Plan piles around engaged crowd targets automatically. Off = only explicit StackUnitOn calls stack units. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking"))
+	bool bEnableAutomaticPiles = true;
+
+	/** Most units in the stack table at once across the world: climbers plus the ground units holding them up. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0"))
+	int32 MaxStackedUnits = 256;
+
+	/** Most climbers in one pile (per engaged group and target). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0"))
+	int32 MaxStackersPerTarget = 40;
+
+	/** Seconds between pile plans for each engaged group. Lower grows piles faster; each plan is O(units near the target). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0.05", ForceUnits = "s"))
+	float PilePlanInterval = 0.25f;
+
+	/** New climbers one pile plan may start, so a pile grows in a ripple rather than all at once. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "1"))
+	int32 MaxClimbersPerPilePass = 6;
+
+	/** Nearest units a pile plan considers around its target. Bounds the plan's cost in a dense horde. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "4"))
+	int32 MaxPileCandidates = 96;
+
+	/**
+	 * A support killed in place (no kill fling) keeps holding the units on it this long, then its corpse drops and the
+	 * pile above slumps. Zero collapses at once. A support that is thrown (launched) always drops its riders at once.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0.0", ForceUnits = "s"))
+	float SupportCorpseHoldSeconds = 0.25f;
+
+	/**
+	 * Client puppets of stacked units (UMassUnitStackSystem::ApplyPresentationStackRole) ease to their replicated height at
+	 * this speed instead of snapping per record.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (ClampMin = "10.0", ForceUnits = "cm/s"))
+	float PresentationClimbSpeed = 300.0f;
+
+	/** Outward speed of a unit falling off a collapsing pile (away from the target). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0.0", ForceUnits = "cm/s"))
+	float CollapseOutwardSpeed = 260.0f;
+
+	/** Upward speed of a unit falling off a collapsing pile. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Stacking", meta = (EditCondition = "bEnableStacking", ClampMin = "0.0", ForceUnits = "cm/s"))
+	float CollapseUpSpeed = 220.0f;
+
+	/** Commands (UMassUnitCommandSystem): seconds between order checks (arrival, stuck, lost paths). Free with no commanded units. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Commands", meta = (ClampMin = "0.02", ClampMax = "1.0", ForceUnits = "s"))
+	float CommandUpdateInterval = 0.1f;
+
+	/** Formation spacing between unit slots when an order does not set its own. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Commands", meta = (ClampMin = "10.0", ForceUnits = "cm"))
+	float DefaultFormationSpacing = 120.0f;
+
+	/** A moving unit that gets no closer to its slot for this long asks for a new path. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Commands", meta = (ClampMin = "0.5", ForceUnits = "s"))
+	float CommandStuckTime = 2.5f;
+
+	/** New paths a stuck or knocked-away unit may ask for before its move order fails (it then stops where it is). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Commands", meta = (ClampMin = "0", ClampMax = "20"))
+	int32 MaxCommandRepaths = 4;
+
+	/**
+	 * Up to this many units per order get the nearest free slot (fewest crossings, O(n^2)); bigger orders are matched by
+	 * sorting units and slots across and along the facing (O(n log n)).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Commands", meta = (ClampMin = "0", ClampMax = "2048"))
+	int32 MaxNearestSlotAssignment = 256;
+
 	/** Optional project catalog. These assets are not spawned automatically. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, config, Category = "Units")
 	TArray<TSoftObjectPtr<UUnitConfigDataAsset>> UnitConfigurations;

@@ -23,4 +23,11 @@ namespace UE::MassUnitSystem::Tags
 	MASSUNITSYSTEMRUNTIME_API FGameplayTag StatusStunned();
 	/** Airborne or knocked down after LaunchUnit: a stun the launch owns (no moving, no attacking). */
 	MASSUNITSYSTEMRUNTIME_API FGameplayTag StatusLaunched();
+
+	/** Climbing up a pile. Templates without a Climb clip play Run instead. */
+	MASSUNITSYSTEMRUNTIME_API FGameplayTag AnimationClimb();
+	/** Bracing under a unit that stands on it. Templates without a Hold clip play Idle instead. */
+	MASSUNITSYSTEMRUNTIME_API FGameplayTag AnimationHold();
+	/** Loose tag on every unit the stack system drives (climbing, standing on a unit, or holding one up). */
+	MASSUNITSYSTEMRUNTIME_API FGameplayTag Stacked();
 }

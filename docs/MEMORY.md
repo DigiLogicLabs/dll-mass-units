@@ -20,8 +20,40 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
 - 2026-10-16 — The runtime module has a hard `GameplayAbilities` dependency even though GAS use is optional at
   runtime. Splitting it out is an open decision.
 
+- 2026-10-17 — Stacking is support-based, not slot-based: a climber stands on a unit, so a pile can only be as tall as
+  the units under it and collapses by itself when they go. Heights replicate for free in an adopter that sends Location
+  with Z (MetalLegs' crowd records compare the full 3D location).
+
 ## Traps
 
 - Windows is case-insensitive: `docs/prd.md` vs `docs/PRD.md` are one file. Never add a doc differing only by case.
 - Standalone `RunUAT BuildPlugin` needs a short `-Package` path (260-character limit).
 - Only one UnrealBuildTool per engine install; `ConflictingInstance` means wait, not `-NoMutex`.
+- 2026-10-17 — Never touch Mass fragments in a service's `Deinitialize`: at world teardown the Mass entity manager may
+  already be gone (`Assertion failed: EntityManager`, MassEntitySubsystem.h:36). Just drop the bookkeeping.
+- 2026-10-17 — The same teardown trap hid in `UMassUnitCrowdSystem::Deinitialize` (it unregistered groups, resetting
+  fragments): any world torn down with registered groups could assert. It only surfaced when a test left groups alive.
+- 2026-10-17 — In tests, spawn targets as `ADefaultPawn`, not `APawn`: a bare `APawn` has no root component, so
+  `SpawnActor` ignores the location and it sits at the origin (only the scenario at the origin "works").
+- 2026-10-17 — Registering a crowd group resets every member's crowd fragment, which clears `bStackDriven`: stack AFTER
+  registering, and expect a re-register (preset switch) to drop piles. `AddUnitsToCrowdGroup` resets only the new units.
+- 2026-10-17 — A unit launched with no landing trace (budget spent, tracing off) lands at its LAUNCH height. Anything
+  thrown from above the ground must cap its landing (`CapLaunchLandingHeight`) or it lands mid-air.
+- 2026-10-17 — Commanded units (`UMassUnitCommandSystem`) keep `bCommanded` across `FMassUnitCrowdFragment::Reset()` on
+  purpose: a group re-register must not drop orders. Only `ReleaseUnits` clears it. The crowd's `ResetCrowdFragment`,
+  pause and disengage never stop a commanded unit. The test world runs no movement processor, so command tests move
+  units by setting their transform and call `TickCommands` with their own clock.
+- 2026-10-17 — `UMassUnitCommandSystem` queues `OnMoveOrderFinished` and flushes at the end of each public call / tick:
+  never broadcast from inside the `Entries` loop or while holding an entry pointer (a Blueprint "on arrival, issue next
+  waypoint" listener re-enters). Other systems that write unit targets (`UFormationSystem`, BT integration, adopter
+  `SetUnitDestination` callers) must skip `bCommanded` units or they wipe order paths every frame.
+- 2026-10-17 — Look rolls quantise the seed to a byte on purpose: adopters replicate the seed as one byte, and a full-float
+  roll on the server would differ from the client's. `RollLook` must keep drawing the same count of random values per
+  roll (`PickWeighted` always draws one, even for an empty list) or editing a part reshuffles every other part.
+- 2026-10-17 — Mass fragments are NOT scanned by the garbage collector (`FMassEntityManager::AddReferencedObjects` only
+  reports shared fragments). A `UPROPERTY` `TObjectPtr` in a regular fragment does not keep anything alive; the editor
+  hides it (`RF_Standalone`), packaged builds free the asset. Hold such assets elsewhere (`RetainedAssets` on the entity
+  manager) or keep the fragment field weak, like `SourceTemplate`.
+- 2026-10-17 — The project build is unity-batched, so a missing include can compile there and still break adopters:
+  run the standalone `RunUAT BuildPlugin` (non-unity host project) after adding files. It caught `MassUnitStackSystem.cpp`
+  using `FMassUnitVelocityFragment` without `MassUnitCommonFragments.h`.
