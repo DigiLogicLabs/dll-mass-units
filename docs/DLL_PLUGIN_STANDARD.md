@@ -29,7 +29,12 @@ breaks every adopter's assets for no benefit). Plugin/module renames use `[CoreR
 - `NOTICE` — `<Plugin name>`, `Copyright <year> Digi Logic Labs LLC`, the website (https://digilogiclabs.com) and the repo URL
 - `README.md` — see *README skeleton* below
 - `CHANGELOG.md` — semantic versioning; `.uplugin` `VersionName` matches the latest entry
-- `CONTRIBUTING.md`
+- `CONTRIBUTING.md` — including the fork → build → test → pull request steps
+- `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1) and `SECURITY.md` (private reporting through GitHub)
+- `.github/ISSUE_TEMPLATE/` (bug report, feature request, `config.yml` with discussion / security / website links)
+  and `.github/PULL_REQUEST_TEMPLATE.md`
+- GitHub settings: public, Issues and Discussions on, private vulnerability reporting on, website = digilogiclabs.com,
+  topics set; `main` is the default branch and always builds; merged work branches are deleted
 - `docs/` — see *Docs set* below
 - `Config/FilterPlugin.ini` — so docs/license ship with packaged plugins
 - Source files start with:

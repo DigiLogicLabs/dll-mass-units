@@ -4,9 +4,11 @@
 (Apache-2.0) by [Digi Logic Labs](https://digilogiclabs.com) ([GitHub](https://github.com/DigiLogicLabs)). Built for, and developed alongside, our own
 UE games.
 
-> **Status: 1.4.0 (stable foundation), UE 5.7.** Core simulation, rendering, crowds and player engagement are
-> released; collective behaviour, statuses, launches, vertex-animation clips and batch spawning are in
-> *Unreleased* ([CHANGELOG](CHANGELOG.md)). The plugin does not replicate units and ships no art.
+> **Status: 1.4.0 released (UE 5.7); `main` is ahead and built alongside our own games.** Released: core
+> simulation, rendering, crowds and player engagement. On `main`, not yet tagged (see *Unreleased* in the
+> [CHANGELOG](CHANGELOG.md)): collective behaviour, statuses, launches, vertex-animation clips, batch spawning,
+> piles, RTS orders, looks and attitudes, behaviour presets, swarm types with flyers and leapers, and the dll-*
+> plugin/module names. The plugin does not replicate units and ships no art.
 > Upgrading from 1.4.x? The plugin and module names changed; see
 > [Migrating from 1.4.x](docs/INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names).
 

@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/DigiLogicLabs/dll-mass-units/discussions
+    about: Ask how to use the plugin or discuss an idea before opening an issue.
+  - name: Security problem
+    url: https://github.com/DigiLogicLabs/dll-mass-units/security/advisories/new
+    about: Report a vulnerability privately - please do not open a public issue.
+  - name: Digi Logic Labs
+    url: https://digilogiclabs.com
+    about: Who builds and maintains this plugin.
