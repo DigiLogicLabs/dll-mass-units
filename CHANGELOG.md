@@ -98,7 +98,7 @@ tagged and `MassUnitSystem.uplugin` still reads `1.4.0`.
   transform (times the look scale) and custom-data row. New custom-data channels 13-15 `TintR/G/B` (`NumFloats` 16,
   append-only; existing channels unchanged).
 - Visual fragment: `LookProfile`, `MaterialOverride`, `LookParts`, `LookScale`, `LookTint`.
-- Doc: [unit_composition.md](unit_composition.md). Test: `MassUnitSystem.Units.Looks`.
+- Doc: [unit_composition.md](docs/unit_composition.md). Test: `MassUnitSystem.Units.Looks`.
 
 #### unit commands (RTS control basics, phase R1)
 - `UMassUnitCommandSystem` (`UMassUnitSubsystem::GetCommandSystem`): orders for units. `IssueMoveOrder(Units,
@@ -268,6 +268,8 @@ tagged and `MassUnitSystem.uplugin` still reads `1.4.0`.
 - Docs: authoring pipeline, artist brief, VAT/status guide and scalability rules (now in `docs/guides/`).
 
 ### Changed
+- Docs: README, `NOTICE` and the `.uplugin` `CreatedByURL` link [digilogiclabs.com](https://digilogiclabs.com); the README license
+  section explains Apache-2.0 in plain words (free for any use, including commercial; keep LICENSE/NOTICE).
 - `CreateUnitFromTemplate` shares the batch-spawn body; its behaviour is unchanged. `SpawnUnits()` uses the batch
   call. `CalculateLocalSpawnOffsets` / `GetPatternRadius` are BlueprintPure and call the static helpers (layouts
   unchanged, parity tested).

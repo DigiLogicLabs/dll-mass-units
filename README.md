@@ -1,7 +1,7 @@
 # DLL Mass Units
 
 **Large crowds of lightweight units on Unreal Engine's native Mass Entity framework.** Open source
-(Apache-2.0) by [Digi Logic Labs](https://github.com/DigiLogicLabs). Built for, and developed alongside, our own
+(Apache-2.0) by [Digi Logic Labs](https://digilogiclabs.com) ([GitHub](https://github.com/DigiLogicLabs)). Built for, and developed alongside, our own
 UE games. Formerly `ue5-mass-units-plugin`; the old GitHub URL redirects.
 
 > **Status: 1.4.0 (stable foundation), UE 5.7.** Core simulation, rendering, crowds and player engagement are
@@ -98,6 +98,11 @@ Part of the Digi Logic Labs `dll-*` plugin family — see [docs/DLL_PLUGIN_STAND
 
 ## License
 
-[Apache License 2.0](LICENSE); see [NOTICE](NOTICE). All source is original Digi Logic Labs work. Unreal Engine
-and its Mass Entity framework are Epic Games products used under the Unreal Engine EULA and are not part of
-this repository. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Free and open source under the [Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). In plain words: use it
+in any project, personal or commercial, change it, ship it in your games and redistribute it, with no fees or
+royalties. When you redistribute the plugin or a modified copy, keep the `LICENSE` and `NOTICE` text with it (for a
+shipped game, its credits or documentation is enough) and mark the files you changed. The license includes a patent
+grant for this code; it does not grant use of the Digi Logic Labs name or logos, and the software comes without
+warranty. All source is original Digi Logic Labs work. Unreal Engine and its Mass Entity framework are Epic Games products used under the Unreal Engine EULA and are not part of this repository. Contributions welcome - see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+More from Digi Logic Labs: [digilogiclabs.com](https://digilogiclabs.com).

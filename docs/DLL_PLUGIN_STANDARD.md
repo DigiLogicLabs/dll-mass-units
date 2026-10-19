@@ -12,6 +12,7 @@ build and read the same way.
 | Plugin name (`.uplugin` file) | `DLL<PascalName>` | `DLLAudio.uplugin` |
 | FriendlyName | `DLL <Name>` | "DLL Audio" |
 | Category | `Digi Logic Labs` | |
+| `.uplugin` URLs | `CreatedByURL` = https://digilogiclabs.com; `DocsURL` = repo `#readme`; `SupportURL` = repo issues | |
 | Modules | `DLL<Name>Runtime`, `DLL<Name>Editor`, optional `DLL<Name><Integration>` | `DLLAudioRuntime`, `DLLAudioGAS` |
 | New C++ types | `UDLL<Name>*`, `FDLL<Name>*`, `EDLL<Name>*` | `UDLLAudioSubsystem` |
 | Console variables | `dll.<Name>.*` | `dll.Audio.Debug` |
@@ -25,6 +26,7 @@ breaks every adopter's assets for no benefit). Plugin/module renames use `[CoreR
 ## Repository contents
 
 - `LICENSE` — Apache-2.0 for every dll-* plugin
+- `NOTICE` — `<Plugin name>`, `Copyright <year> Digi Logic Labs LLC`, the website (https://digilogiclabs.com) and the repo URL
 - `README.md` — see *README skeleton* below
 - `CHANGELOG.md` — semantic versioning; `.uplugin` `VersionName` matches the latest entry
 - `CONTRIBUTING.md`
@@ -43,7 +45,7 @@ Repos contain our own code and our own content only.
 
 Keep the README short: it answers *what, why, how do I start*. Everything deeper lives in `docs/`.
 
-1. `# DLL <Name>` + one-line tagline + license/owner line
+1. `# DLL <Name>` + one-line tagline + license/owner line, linking [Digi Logic Labs](https://digilogiclabs.com) (and the GitHub org)
 2. **Status** callout — version, maturity, what is not done yet
 3. **Why** — the problem, in a few lines
 4. **What's in X.Y.Z** — one table, one row per public piece
@@ -53,7 +55,9 @@ Keep the README short: it answers *what, why, how do I start*. Everything deeper
 8. **Documentation** — link to `docs/README.md` and the AI layer
 9. **Tests** — automation prefix and how to run it
 10. **Sister plugins** — link to this standard
-11. **License**
+11. **License** — Apache-2.0 plus the same plain-words summary in every repo: free for any use, personal or
+    commercial, with no fees; keep `LICENSE`/`NOTICE` when redistributing and mark changed files; no trademark
+    grant, no warranty; then a link to https://digilogiclabs.com
 
 ## Docs set (exactly this; nothing else at `docs/` top level)
 
