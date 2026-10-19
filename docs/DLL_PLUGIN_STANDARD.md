@@ -74,7 +74,6 @@ Keep the README short: it answers *what, why, how do I start*. Everything deeper
 | `AI_WORKFLOW.md` | The AI session loop |
 | `DLL_PLUGIN_STANDARD.md` | This file, identical in every repo |
 | `RESEARCH.md` *(optional)* | Background research that shaped the design |
-| `PROVENANCE.md` *(only while needed)* | Audit of any file whose origin is not yet cleared |
 | `guides/*.md` *(optional)* | Long task-specific guides linked from INTEGRATION_GUIDE (e.g. an art pipeline) |
 | `sessions/` | Dated hand-offs |
 
@@ -121,7 +120,7 @@ Every dll-* repo carries the same AI context so any contributor's assistant gets
 ## Coding rules (shared by every dll-* plugin)
 
 Each repo's `.github/instructions/cpp.instructions.md` links here and adds only its plugin-specific rules.
-These match the practices of the games we build them for (MetalLegs `CLAUDE.md`).
+These match the practices of the games we build them for (their AI rule files).
 
 **Behaviour**
 1. **Event-driven first.** Delegates, OnRep, online/engine callbacks and `FTimerManager` timers. Tick only
