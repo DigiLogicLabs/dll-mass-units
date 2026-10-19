@@ -11,6 +11,7 @@
 
 class UInstancedStaticMeshComponent;
 class UMassEntitySubsystem;
+class UMaterialInterface;
 class UStaticMesh;
 
 /**
@@ -60,10 +61,38 @@ namespace UE::MassUnitSystem::CrowdCustomData
 	inline constexpr int32 ClipFrameCount = 11;
 	/** Playback rate in frames per second. Positive loops; negative plays once and holds the last frame. */
 	inline constexpr int32 ClipFramesPerSecond = 12;
+	/** Look tint (UMassUnitLookProfile::TintPalette), white without a profile. Same value on the body and every part. */
+	inline constexpr int32 TintR = 13;
+	inline constexpr int32 TintG = 14;
+	inline constexpr int32 TintB = 15;
 
 	/** Total floats reserved per instance. Append-only; see the channel contract above. */
-	inline constexpr int32 NumFloats = 13;
+	inline constexpr int32 NumFloats = 16;
 }
+
+/** What one instanced component draws: a mesh, optionally with a material override on every slot (look variants). */
+USTRUCT()
+struct FCrowdBucketKey
+{
+	GENERATED_BODY()
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMesh> Mesh = nullptr;
+
+	/** Null = the mesh's own materials. */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> Material = nullptr;
+
+	friend bool operator==(const FCrowdBucketKey& A, const FCrowdBucketKey& B)
+	{
+		return A.Mesh == B.Mesh && A.Material == B.Material;
+	}
+
+	friend uint32 GetTypeHash(const FCrowdBucketKey& Key)
+	{
+		return HashCombine(GetTypeHash(Key.Mesh), GetTypeHash(Key.Material));
+	}
+};
 
 /**
  * One instanced-static-mesh component plus the stable slot bookkeeping for the units drawn by it.
@@ -147,7 +176,7 @@ public:
 	void SetFallbackMesh(UStaticMesh* InFallbackMesh) { FallbackMesh = InFallbackMesh; }
 	void SetMaxUnits(int32 InMaxUnits) { MaxUnits = FMath::Max(1, InMaxUnits); }
 
-	/** Number of ISM components allocated, which equals the number of distinct unit meshes in view. */
+	/** Number of ISM components allocated: one per distinct mesh + material override (bodies and look parts). */
 	int32 GetComponentCount() const { return Buckets.Num(); }
 
 	/** Units currently drawn. Excludes parked slots retained for reuse. */
@@ -172,16 +201,16 @@ private:
 	TObjectPtr<UStaticMesh> FallbackMesh = nullptr;
 
 	UPROPERTY(Transient)
-	TMap<TObjectPtr<UStaticMesh>, FCrowdInstanceBucket> Buckets;
+	TMap<FCrowdBucketKey, FCrowdInstanceBucket> Buckets;
 
-	/** Which mesh currently owns each entity's slot, so a mesh swap releases the old bucket's slot. */
-	TMap<FMassEntityHandle, TObjectPtr<UStaticMesh>> EntityBucketMesh;
+	/** Which bucket currently owns each entity's body slot, so a body swap releases the old bucket's slot. */
+	TMap<FMassEntityHandle, FCrowdBucketKey> EntityBucketMesh;
 
 	int32 MaxUnits = 10000;
 	int32 TopologyRevision = 0;
 
-	FCrowdInstanceBucket* FindOrAddBucket(UStaticMesh* Mesh);
-	UInstancedStaticMeshComponent* CreateComponent(UStaticMesh* Mesh) const;
+	FCrowdInstanceBucket* FindOrAddBucket(const FCrowdBucketKey& Key);
+	UInstancedStaticMeshComponent* CreateComponent(const FCrowdBucketKey& Key) const;
 
 	/** Returns an existing, recycled, or freshly appended slot for the entity. */
 	int32 AcquireSlot(FCrowdInstanceBucket& Bucket, FMassEntityHandle Entity);

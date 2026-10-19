@@ -314,3 +314,74 @@ toggles above.
 | GAS bridge calls return false | Register a valid externally owned ASC for the unit first |
 | Crowd too expensive | Raise `CrowdUpdateInterval` / LOD multipliers, lower `MaxCrowdUnitsPerUpdate`, set `MaxSimulationDistance`, keep radii near the cell size, cut `MaxVisibleDistance`; never an ASC/BT/Actor per ambient unit |
 | Headless automation crashes on first tick | Some UE 5.7.2 installs fail with `-NullRHI`; use `-RenderOffscreen` with a real RHI; don't add `-NoShaderCompile` on a fresh host |
+
+## 16. Motion styles, piles, looks, attitudes, presets, orders and swarm types *(Unreleased)*
+
+### Motion styles
+
+`FMassUnitCrowdConfig::MotionStyle` picks the ambient movement: `Wander` (random destinations, the default), `Flock`
+(boids around a roaming goal), `Swarm` (orbiting cloud around a drifting centre) or `Hive` (home cluster plus foragers).
+`FMassUnitCrowdConfig::Motion` holds each style's tuning; `GetCrowdGroupMotionGoal` / `GetCrowdGroupMotionStyle` expose
+it. Engaged groups ignore the style and chase as before. `AddUnitsToCrowdGroup` grows a live group without resetting it.
+
+### Stacking and piles
+
+`UMassUnitStackSystem` (from `UMassUnitSubsystem::GetStackSystem`) lets units climb onto other units. It is opt-in per
+template (`UUnitTemplate::Stacking.bCanStack`) and capped by the Stacking settings. `StackUnitOn(Climber, Support,
+FaceTarget)` puts a climber on a support: it climbs to one `StackHeight` above the support's pivot and the movement
+processor leaves it alone (`FMassUnitCrowdFragment::bStackDriven`). A ground support is frozen in place while something
+stands on it. Losing a support (death, launch, destruction, release) throws its riders off with `LaunchUnit`, which
+cascades up the pile. The pile planner does this automatically for engaged crowd groups on the server. Queries:
+`IsUnitStacked`, `GetUnitStackLevel`, `GetUnitStackRole`, `GetUnitStackSupport`, `GetStackStats`. Topple piles with
+`CollapseAllStacks` / `CollapseStacksInRadius`. Events: `OnUnitStackChanged`, `OnUnitStackCollapsed`. The plugin
+replicates nothing: heights reach clients through whatever replicates unit locations (Z included).
+
+### Looks
+
+`UMassUnitLookProfile` dresses units: weighted body variants (mesh + optional material), modular parts drawn with the
+body (chance + weighted options), a scale range and a tint palette (custom data 13-15). Set it on a template
+(`LookProfile`), a spawn batch (`FMassUnitBatchSpawnOptions::LookProfile`) or a unit (`SetUnitLookProfile`). The roll is
+deterministic from the variant seed at byte precision, so replicating the seed reproduces the look. Parts share the
+body's transform and per-instance data: bake a modular VAT kit in one AnimToTexture pass. `GetUnitLook` reports what a
+unit wears; `RollLook` previews a seed. Instanced band only (the skeletal near band draws the template mesh).
+
+### Attitudes
+
+`UMassUnitAttitudeProfile` gives units of one template individual temperaments: speed, attack cooldown and looping
+animation tempo ranges (optionally linked into one "energy" roll), courage (the order units flee in when their group
+routs) and a climb chance (unwilling units never climb piles). Set it on a template (`AttitudeProfile`), a batch
+(`FMassUnitBatchSpawnOptions::AttitudeProfile`) or a unit (`SetUnitAttitudeProfile`); `GetUnitAttitude` reports the roll.
+Group-wide behaviour (motion style, engagement, morale) stays on the crowd group.
+
+### Behaviour presets
+
+`UMassUnitBehaviorPreset` bundles a crowd group's crowd config, navigation, engagement and collective behaviour.
+`RegisterCrowdGroupFromPreset(Units, Center, Preset)` registers a group from it; `ApplyCrowdGroupPreset(Group, Preset)`
+swaps a live group's temperament (same handle and units; the subgroup layout from registration is kept; commanded and
+stacked units are untouched). `SetCrowdGroupConfig` changes a live group's crowd config by hand.
+
+### Commands (RTS control)
+
+`UMassUnitCommandSystem` (from `UMassUnitSubsystem::GetCommandSystem`) gives units orders. `IssueMoveOrder(Units, Order)`
+moves a selection into a formation (`FMassUnitMoveOrder`: Destination, Facing, Shape, Spacing, AcceptanceRadius,
+bUseNavigation, bMatchSpeed) and returns an order id; `OnMoveOrderFinished` fires when every unit arrived, failed or got
+another order. `IssueStopOrder` / `IssueHoldOrder` stop units in place (they stay under orders), `ReleaseUnits` /
+`ReleaseAllUnits` hand them back to their crowd group. A unit under orders has `FMassUnitCrowdFragment::bCommanded`: the
+crowd keeps it apart from neighbours but never moves it, and the pile planner skips it. Queries: `IsUnitCommanded`,
+`GetUnitOrder` (`EMassUnitOrder` None / Idle / Move / Hold), `GetUnitOrderSlot`, `GetUnitOrderId`, `GetCommandStats`.
+`ComputeFormationSlots` is the pure layout (move previews). Call it on the server; selection, input, ownership and order
+replication belong to the adopter. Attack orders, auto-acquire and stances are the next phase.
+
+### Swarm types, flyers and leapers
+
+`UMassUnitSwarmType` (data asset) bundles a template, look profile, attitude profile, behaviour preset and a locomotion
+(`Ground` / `Air`); `UMassUnitSwarmType::SpawnSwarm(World, Type, Center, Count, Radius, Seed, TeamOverride)` spawns and
+registers one crowd group. An `Air` type flies: `MakeCrowdConfig` switches the group to Free 3D with an altitude band
+(`FMassUnitCrowdConfig::bUseAltitudeBand`, `MinAltitude` / `MaxAltitude` above the ground under the group centre,
+`EngagedHoverHeight`, `FloorClearance`, `bFallWhenKilled`); `GetCrowdGroupAltitudeBand` reports it. Engaged flyers hover
+over the target until they get an attack token, then dive. Leapers: `LeapUnit(Unit, Point, ArcHeight)` sends a living unit
+on an arc to a point and lands it on its feet (`IsUnitLeaping`, `OnUnitLeapt`; clip tag `MassUnit.Animation.Leap`, falling
+back to Attack); `FMassUnitPlayerEngagementConfig::bEnablePounce` makes engaged ground units jump at the target from
+`PounceMinRange`-`PounceMaxRange`, holding an attack token through the flight; a landing within `PounceHitRadius` is one
+attack (`PounceDamageMultiplier`). Replicating leaps to clients is the adopter's job (bind `OnUnitLeapt`). Design and
+roadmap: [unit_composition.md](unit_composition.md) section 4.

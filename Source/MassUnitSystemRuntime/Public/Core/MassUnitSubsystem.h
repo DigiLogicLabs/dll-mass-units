@@ -11,9 +11,11 @@ class UGASUnitIntegration;
 class UFormationSystem;
 class UMassEntitySubsystem;
 class UMassUnitBehaviorIntegration;
+class UMassUnitCommandSystem;
 class UMassUnitCrowdSystem;
 class UMassUnitEntityManager;
 class UMassUnitNavigationSystem;
+class UMassUnitStackSystem;
 class UNiagaraUnitSystem;
 class UUnitGameplayEventSystem;
 class UUnitMeshPool;
@@ -62,6 +64,14 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System")
 	UUnitGameplayEventSystem* GetGameplayEventSystem() const { return GameplayEventSystem; }
 
+	/** Stacking and piling (units climbing onto units). See UUnitTemplate::Stacking. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System")
+	UMassUnitStackSystem* GetStackSystem() const { return StackSystem; }
+
+	/** Orders for units (move in formation, stop, hold). See UMassUnitCommandSystem. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System")
+	UMassUnitCommandSystem* GetCommandSystem() const { return CommandSystem; }
+
 	UMassEntitySubsystem* GetEntitySubsystem() const { return EntitySubsystem; }
 
 private:
@@ -94,4 +104,10 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UUnitGameplayEventSystem> GameplayEventSystem = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMassUnitStackSystem> StackSystem = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMassUnitCommandSystem> CommandSystem = nullptr;
 };

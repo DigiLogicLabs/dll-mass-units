@@ -300,7 +300,19 @@ bool FMassUnitNativeLifecycleTest::RunTest(const FString& Parameters)
 		bFoundInteractingUnit |= State && State->CurrentState == EMassUnitState::Interacting;
 	}
 	TestTrue(TEXT("Crowd interactions write the lightweight interaction state"), bFoundInteractingUnit);
-	TestTrue(TEXT("Interaction group unregisters cleanly"), CrowdSystem->UnregisterCrowdGroup(InteractionGroupHandle, true));
+	// Joining another group mid-interaction (a preset swap) resets the crowd fragment: the unit must not stay Interacting.
+	FMassUnitCrowdConfig RejoinConfig = InteractionConfig;
+	RejoinConfig.bEnableInteractions = false;
+	const int32 RejoinGroupHandle = CrowdSystem->RegisterCrowdGroup(SpawnedUnits, Spawner->GetActorLocation(), RejoinConfig, false, 25.0f);
+	CrowdSystem->ForceCrowdGroupUpdate(RejoinGroupHandle);
+	int32 StillInteracting = 0;
+	for (const FMassUnitHandle& UnitHandle : SpawnedUnits)
+	{
+		const FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(UnitHandle.EntityHandle.ToMassEntityHandle());
+		StillInteracting += State && State->CurrentState == EMassUnitState::Interacting ? 1 : 0;
+	}
+	TestEqual(TEXT("Units moved to a new group mid-interaction stop interacting"), StillInteracting, 0);
+	TestTrue(TEXT("Interaction group unregisters cleanly"), CrowdSystem->UnregisterCrowdGroup(RejoinGroupHandle, true));
 
 	FMassUnitCrowdConfig Free3DConfig;
 	Free3DConfig.MovementMode = EMassUnitCrowdMovementMode::Free3D;

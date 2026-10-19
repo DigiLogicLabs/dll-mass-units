@@ -9,8 +9,11 @@
 #include "GameplayAbilitySpec.h"
 #include "GameplayTagContainer.h"
 #include "MassEntityTypes.h"
+#include "Visual/MassUnitLookProfile.h"
 #include "MassUnitFragments.generated.h"
 
+class UMassUnitAttitudeProfile;
+class UMaterialInterface;
 class USkeletalMesh;
 class UStaticMesh;
 class UTexture2D;
@@ -106,8 +109,20 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitStateFragment : public FMassFragment
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Mass Unit|Status")
 	float StatusMoveSpeedMultiplier = 1.0f;
 
+	/** Attitude: 0 flees first when the unit's group routs, 1 holds longest. Negative = random rout order. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit|Attitude")
+	float Courage = -1.0f;
+
+	/** Attitude: the pile planner never makes this unit climb (it can still hold others up). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit|Attitude")
+	bool bAvoidsClimbing = false;
+
 	/** Presentation-only units (client puppets): last replicated swing counter seen, see ApplyPresentationState. */
 	uint8 PresentationSwingCounter = 0;
+
+	/** In a LeapUnit jump (a pounce): held like a launch, but plays the Leap clip and lands on its feet (no knockdown). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit|State")
+	bool bLeaping = false;
 
 	/** Starts a swing: restarts the attack clip and records the damage to land at the impact delay. */
 	void BeginAttackSwing(float Damage)
@@ -323,6 +338,26 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitVisualFragment : public FMassFragment
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMesh> StaticMesh = nullptr;
 
+	/** Look profile the unit's look was rolled from (null = template mesh as is). See UMassUnitLookProfile. */
+	UPROPERTY(Transient)
+	TObjectPtr<UMassUnitLookProfile> LookProfile = nullptr;
+
+	/** Body material from the rolled look (null = the mesh's own). */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> MaterialOverride = nullptr;
+
+	/** Modular parts from the rolled look, drawn with the body. */
+	UPROPERTY(Transient)
+	TArray<FMassUnitLookPiece> LookParts;
+
+	/** Uniform instance scale from the rolled look. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit")
+	float LookScale = 1.0f;
+
+	/** Tint from the rolled look (custom data 13-15). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit")
+	FLinearColor LookTint = FLinearColor::White;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UTexture2D> VertexAnimationTexture = nullptr;
 
@@ -337,6 +372,13 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitVisualFragment : public FMassFragment
 
 	/** Speed above which the move clip switches from Walk to Run. Zero never uses Run. */
 	float RunSpeedThreshold = 0.0f;
+
+	/** Attitude profile the unit's temperament was rolled from (null = template values as is). */
+	UPROPERTY(Transient)
+	TObjectPtr<UMassUnitAttitudeProfile> AttitudeProfile = nullptr;
+
+	/** Attitude: playback rate of looping vertex-animation clips (one-shots keep their timing). */
+	float AnimationRate = 1.0f;
 
 	/**
 	 * Deterministic 0-1 seed for everything random about how this unit LOOKS (animation phase today; variant parts,
@@ -448,6 +490,32 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdFragment : public FMassFragment
 	bool bSleeping = false;
 	bool bUse3DMovement = false;
 	bool bConformToNavmeshHeight = false;
+	/** UMassUnitStackSystem owns this unit's position (climbing or standing on another unit); the movement processor skips it. */
+	bool bStackDriven = false;
+	/** Crowd motion style bookkeeping (Hive: 0 home, 1 foraging out, 2 lingering before the trip home). */
+	uint8 MotionPhase = 0;
+	/**
+	 * Presentation only (client puppets of stacked units): EMassUnitStackRole replicated by the adopter. Non-zero makes the
+	 * movement processor ease the unit's height toward its destination height and play the Climb / Hold clip. The real
+	 * (server) stacked units never use it - they are bStackDriven.
+	 */
+	uint8 PresentationStackRole = 0;
+	/**
+	 * UMassUnitCommandSystem owns this unit's orders (move, stop, hold): the crowd system leaves its destination alone
+	 * (no wander, motion styles, engagement, interactions or sleep) and the pile planner never uses it. Owned by the
+	 * command system, so Reset() keeps it (a crowd group re-registering does not drop the unit's orders).
+	 */
+	bool bCommanded = false;
+	/**
+	 * Free 3D altitude band (FMassUnitCrowdConfig::bUseAltitudeBand): the movement processor never lets the unit sink
+	 * below AltitudeFloorZ. Refreshed from the group by the crowd system.
+	 */
+	float AltitudeFloorZ = 0.0f;
+	bool bAltitudeFloor = false;
+	/** Engagement pounce (FMassUnitPlayerEngagementConfig::bEnablePounce): world time this unit may pounce again. */
+	float NextPounceTime = 0.0f;
+	/** Dying in the air starts a corpse fall (UMassUnitEntityManager death-fall queue) instead of hanging in place. */
+	bool bFallWhenKilled = false;
 
 	void Reset()
 	{
@@ -470,6 +538,13 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdFragment : public FMassFragment
 		bSleeping = false;
 		bUse3DMovement = false;
 		bConformToNavmeshHeight = false;
+		bStackDriven = false;
+		MotionPhase = 0;
+		PresentationStackRole = 0;
+		AltitudeFloorZ = 0.0f;
+		bAltitudeFloor = false;
+		NextPounceTime = 0.0f;
+		bFallWhenKilled = false;
 	}
 };
 

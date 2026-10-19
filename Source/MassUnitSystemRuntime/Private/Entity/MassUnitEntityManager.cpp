@@ -10,6 +10,8 @@ DECLARE_CYCLE_STAT(TEXT("Prune Invalid Units"), STAT_MassUnit_PruneInvalidUnits,
 
 #include "Config/MassUnitSystemSettings.h"
 #include "Core/MassUnitGameplayTags.h"
+#include "Core/MassUnitSubsystem.h"
+#include "Gameplay/MassUnitCommandSystem.h"
 #include "Core/MassUnitSystemRuntime.h"
 #include "Entity/UnitTemplate.h"
 #include "Engine/SkeletalMesh.h"
@@ -47,6 +49,7 @@ void UMassUnitEntityManager::Deinitialize()
 	NextStatusTickTime = 0.0f;
 	ActiveLaunches.Reset();
 	PendingRagdollRequests.Reset();
+	PendingDeathFalls.Reset();
 	UnitArchetype = FMassArchetypeHandle();
 	RuntimeDefaultTemplate = nullptr;
 	EntitySubsystem = nullptr;
@@ -208,6 +211,11 @@ FMassUnitEntityHandle UMassUnitEntityManager::CreateUnitInternal(
 	Visual.VariantSeed = VariantStream
 		? VariantStream->FRand()
 		: FMath::Frac(static_cast<float>(NativeHandle.Index) * 0.6180339887f);
+	// The look rolls from the seed, so a client puppet that later receives the server's seed re-rolls the same look.
+	Visual.LookProfile = Options && Options->LookProfile ? Options->LookProfile.Get() : Template->LookProfile.LoadSynchronous();
+	ApplyLook(Visual);
+	Visual.AttitudeProfile = Options && Options->AttitudeProfile ? Options->AttitudeProfile.Get() : Template->AttitudeProfile.LoadSynchronous();
+	ApplyAttitude(NativeHandle, State, Visual, nullptr);
 	Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationIdle();
 	Visual.TargetAnimation = Visual.CurrentAnimation;
 	Visual.bUseSkeletalMesh = false;
@@ -584,6 +592,14 @@ bool UMassUnitEntityManager::ApplyDamageInternal(
 	{
 		State->CurrentState = EMassUnitState::Dead;
 		State->StateTime = 0.0f;
+		// Flyers (crowd altitude band): fall as a corpse instead of hanging where they died.
+		const FMassEntityHandle NativeHandle = EntityHandle.ToMassEntityHandle();
+		const FMassUnitCrowdFragment* Crowd = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+		if (Crowd && Crowd->bFallWhenKilled && !ActiveLaunches.Contains(NativeHandle))
+		{
+			const FMassUnitVelocityFragment* Velocity = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVelocityFragment>(NativeHandle);
+			PendingDeathFalls.Emplace(EntityHandle, Velocity ? Velocity->Value : FVector::ZeroVector, Crowd->AltitudeFloorZ);
+		}
 	}
 
 	if (bDeferEvents && EntitySubsystem && EntitySubsystem->GetWorld())
@@ -1009,6 +1025,194 @@ bool UMassUnitEntityManager::SetUnitVariantSeed(FMassUnitHandle UnitHandle, floa
 		return false;
 	}
 	Visual->VariantSeed = FMath::Clamp(Seed, 0.0f, 1.0f);
+	ApplyLook(*Visual);
+	if (Visual->AttitudeProfile)
+	{
+		FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+		const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+		if (FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle))
+		{
+			ApplyAttitude(Handle, *State, *Visual, EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle));
+		}
+	}
+	return true;
+}
+
+void UMassUnitEntityManager::RetainProfile(UObject* Profile)
+{
+	if (!Profile || RetainedAssets.Contains(Profile))
+	{
+		return;
+	}
+	RetainedAssets.Add(Profile);
+	const UMassUnitLookProfile* Look = Cast<UMassUnitLookProfile>(Profile);
+	const UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	// A dedicated server draws nothing: it never loads look meshes or materials.
+	if (Look && !(World && World->GetNetMode() == NM_DedicatedServer))
+	{
+		TArray<UObject*> Assets;
+		Look->LoadAllOptionAssets(Assets);
+		for (UObject* Asset : Assets)
+		{
+			RetainedAssets.Add(Asset);
+		}
+	}
+}
+
+void UMassUnitEntityManager::ApplyAttitude(const FMassEntityHandle& Handle, FMassUnitStateFragment& State, FMassUnitVisualFragment& Visual, FMassUnitCrowdFragment* Crowd)
+{
+	RetainProfile(Visual.AttitudeProfile);
+	const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+	const FMassUnitRolledAttitude Attitude = Visual.AttitudeProfile ? Visual.AttitudeProfile->RollAttitude(Visual.VariantSeed) : FMassUnitRolledAttitude();
+	if (Template)
+	{
+		const float NewSpeed = FMath::Max(0.0f, Template->MoveSpeed) * Attitude.MoveSpeedMultiplier;
+		// Under orders: the order owns the live speed (matched formation speed); its saved speed takes the new value so
+		// release restores the new temperament.
+		UMassUnitCommandSystem* Commands = nullptr;
+		if (Crowd && Crowd->bCommanded)
+		{
+			const UMassUnitSubsystem* Subsystem = GetTypedOuter<UMassUnitSubsystem>();
+			Commands = Subsystem ? Subsystem->GetCommandSystem() : nullptr;
+		}
+		if (!(Commands && Commands->UpdateSavedMoveSpeed(FMassUnitHandle(Handle), NewSpeed)))
+		{
+			State.MoveSpeed = NewSpeed;
+		}
+		const float TemplateCooldown = FMath::Max(0.0f, Template->AttackCooldown);
+		State.AttackCooldown = TemplateCooldown;
+		// Never shorter than the swing's impact delay - unless the template itself is authored that way (left as is).
+		if (Visual.AttitudeProfile && TemplateCooldown > 0.0f && TemplateCooldown >= State.AttackImpactDelay + 0.05f)
+		{
+			State.AttackCooldown = FMath::Max(TemplateCooldown * Attitude.AttackCooldownMultiplier, State.AttackImpactDelay + 0.05f);
+		}
+	}
+	Visual.AnimationRate = Attitude.AnimationRate;
+	State.Courage = Attitude.Courage;
+	State.bAvoidsClimbing = !Attitude.bWillClimb;
+	// A grouped unit the crowd drives keeps its crowd speed in step (the crowd scales wander and chase from it).
+	if (Crowd && Crowd->BaseMoveSpeed > 0.0f && !Crowd->bCommanded)
+	{
+		Crowd->BaseMoveSpeed = State.MoveSpeed;
+	}
+}
+
+bool UMassUnitEntityManager::SetUnitAttitudeProfile(FMassUnitHandle UnitHandle, UMassUnitAttitudeProfile* Profile)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitVisualFragment* Visual = EntityManager.GetFragmentDataPtr<FMassUnitVisualFragment>(Handle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle);
+	if (!Visual || !State)
+	{
+		return false;
+	}
+	Visual->AttitudeProfile = Profile;
+	ApplyAttitude(Handle, *State, *Visual, EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle));
+	return true;
+}
+
+UMassUnitAttitudeProfile* UMassUnitEntityManager::GetUnitAttitudeProfile(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return nullptr;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Visual ? Visual->AttitudeProfile.Get() : nullptr;
+}
+
+bool UMassUnitEntityManager::GetUnitAttitude(FMassUnitHandle UnitHandle, FMassUnitRolledAttitude& OutAttitude) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	OutAttitude = Visual->AttitudeProfile ? Visual->AttitudeProfile->RollAttitude(Visual->VariantSeed) : FMassUnitRolledAttitude();
+	return true;
+}
+
+void UMassUnitEntityManager::ApplyLook(FMassUnitVisualFragment& Visual)
+{
+	RetainProfile(Visual.LookProfile);
+	const UUnitTemplate* Template = Visual.SourceTemplate.Get();
+	UStaticMesh* TemplateMesh = Template ? Template->StaticMesh.LoadSynchronous() : Visual.StaticMesh.Get();
+	const UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
+	const bool bDedicatedServer = World && World->GetNetMode() == NM_DedicatedServer;
+	// A dedicated server draws nothing: it keeps the profile (for queries) but never rolls or loads look assets.
+	if (!Visual.LookProfile || bDedicatedServer)
+	{
+		Visual.StaticMesh = TemplateMesh;
+		Visual.MaterialOverride = nullptr;
+		Visual.LookParts.Reset();
+		Visual.LookScale = 1.0f;
+		Visual.LookTint = FLinearColor::White;
+		return;
+	}
+	const FMassUnitRolledLook Look = Visual.LookProfile->RollLook(Visual.VariantSeed);
+	Visual.StaticMesh = Look.Body.Mesh ? Look.Body.Mesh.Get() : TemplateMesh;
+	Visual.MaterialOverride = Look.Body.Material;
+	Visual.LookParts = Look.Parts;
+	Visual.LookScale = Look.Scale;
+	Visual.LookTint = Look.Tint;
+}
+
+bool UMassUnitEntityManager::SetUnitLookProfile(FMassUnitHandle UnitHandle, UMassUnitLookProfile* Profile)
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassUnitVisualFragment* Visual = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	Visual->LookProfile = Profile;
+	ApplyLook(*Visual);
+	return true;
+}
+
+UMassUnitLookProfile* UMassUnitEntityManager::GetUnitLookProfile(FMassUnitHandle UnitHandle) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return nullptr;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	return Visual ? Visual->LookProfile.Get() : nullptr;
+}
+
+bool UMassUnitEntityManager::GetUnitLook(FMassUnitHandle UnitHandle, FMassUnitRolledLook& OutLook) const
+{
+	if (!IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	const FMassUnitVisualFragment* Visual = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVisualFragment>(
+		UnitHandle.EntityHandle.ToMassEntityHandle());
+	if (!Visual)
+	{
+		return false;
+	}
+	OutLook.Body.Mesh = Visual->StaticMesh;
+	OutLook.Body.Material = Visual->MaterialOverride;
+	OutLook.Parts = Visual->LookParts;
+	OutLook.Scale = Visual->LookScale;
+	OutLook.Tint = Visual->LookTint;
 	return true;
 }
 
@@ -1304,7 +1508,10 @@ bool UMassUnitEntityManager::LaunchUnit(FMassUnitHandle UnitHandle, FVector Velo
 	Launch->Bounces = 0;
 	Launch->bSettling = false;
 	Launch->bDead = bDead;
-	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity);
+	// A launch replaces a leap in progress (a knockback mid-pounce): it lands as a launch, with the knockdown.
+	Launch->bLeap = false;
+	State->bLeaping = false;
+	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity, &Launch->bLandZFromTrace);
 
 	if (bDead)
 	{
@@ -1338,13 +1545,31 @@ bool UMassUnitEntityManager::IsUnitAirborne(FMassUnitHandle UnitHandle) const
 	return UnitHandle.IsValid() && ActiveLaunches.Contains(UnitHandle.EntityHandle.ToMassEntityHandle());
 }
 
+bool UMassUnitEntityManager::CapLaunchLandingHeight(FMassUnitHandle UnitHandle, float MaxLandZ)
+{
+	FActiveLaunch* Launch = UnitHandle.IsValid() ? ActiveLaunches.Find(UnitHandle.EntityHandle.ToMassEntityHandle()) : nullptr;
+	if (!Launch)
+	{
+		return false;
+	}
+	if (!Launch->bLandZFromTrace)
+	{
+		Launch->LandZ = FMath::Min(Launch->LandZ, MaxLandZ);
+	}
+	return true;
+}
+
 TArray<TPair<FMassUnitEntityHandle, FVector>> UMassUnitEntityManager::ConsumeRagdollRequests()
 {
 	return MoveTemp(PendingRagdollRequests);
 }
 
-float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity) const
+float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVector& Velocity, float Gravity, bool* bOutHitGround) const
 {
+	if (bOutHitGround)
+	{
+		*bOutHitGround = false;
+	}
 	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
 	UWorld* World = EntitySubsystem ? EntitySubsystem->GetWorld() : nullptr;
 	if (!World || !Settings || !Settings->bTraceLandingGround)
@@ -1372,6 +1597,10 @@ float UMassUnitEntityManager::ResolveLandingZ(const FVector& Start, const FVecto
 	if (World->LineTraceSingleByObjectType(Hit, Landing + FVector(0.0f, 0.0f, 200.0f), Landing - FVector(0.0f, 0.0f, 1500.0f),
 		StaticWorld, FCollisionQueryParams(SCENE_QUERY_STAT(MassUnitLaunchLanding), false)))
 	{
+		if (bOutHitGround)
+		{
+			*bOutHitGround = true;
+		}
 		return Hit.ImpactPoint.Z;
 	}
 	return Start.Z;
@@ -1389,9 +1618,108 @@ void UMassUnitEntityManager::StartCorpseTumble(FActiveLaunch& Launch, const FMas
 	Launch.RollRate = Rate * 0.35f * (SeedB * 2.0f - 1.0f);
 }
 
+bool UMassUnitEntityManager::IsUnitLeaping(FMassUnitHandle UnitHandle) const
+{
+	const FActiveLaunch* Launch = UnitHandle.IsValid() ? ActiveLaunches.Find(UnitHandle.EntityHandle.ToMassEntityHandle()) : nullptr;
+	return Launch && Launch->bLeap && !Launch->bDead;
+}
+
+bool UMassUnitEntityManager::LeapUnit(FMassUnitHandle UnitHandle, FVector TargetPoint, float ArcHeight)
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	if (!Settings || !Settings->bEnableUnitLaunch || !IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle);
+	const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle);
+	if (!Transform || !State || State->CurrentState == EMassUnitState::Dead || ActiveLaunches.Contains(Handle)
+		|| (Crowd && Crowd->bStackDriven) || ActiveLaunches.Num() >= Settings->MaxAirborneUnits)
+	{
+		return false;
+	}
+	// Like LaunchUnit: a unit immune to the Launched status cannot be held for the flight, so it would walk and attack
+	// in the air. It does not leap.
+	const FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(Handle);
+	if (Ability && UE::MassUnitSystem::Tags::StatusLaunched().MatchesAny(Ability->StatusImmunityTags))
+	{
+		return false;
+	}
+
+	// Land at the unit's own height over the ground (pivot offset), on the ground under the target point.
+	const float Gravity = FMath::Max(1.0f, Settings->LaunchGravity);
+	FTransform& UnitTransform = Transform->GetMutableTransform();
+	const FVector Start = UnitTransform.GetLocation();
+	bool bStartGround = false;
+	bool bTargetGround = false;
+	const float StartGroundZ = ResolveLandingZ(Start, FVector::ZeroVector, Gravity, &bStartGround);
+	const float TargetGroundZ = ResolveLandingZ(TargetPoint, FVector::ZeroVector, Gravity, &bTargetGround);
+	const float PivotOffset = bStartGround ? Start.Z - StartGroundZ : 0.0f;
+	const float LandZ = bTargetGround ? TargetGroundZ + PivotOffset : Start.Z;
+
+	const FVector Land(TargetPoint.X, TargetPoint.Y, LandZ);
+	const float ApexZ = FMath::Max(Start.Z, LandZ) + FMath::Max(10.0f, ArcHeight);
+	const float UpSpeed = FMath::Sqrt(2.0f * Gravity * (ApexZ - Start.Z));
+	const float FlightSeconds = FMath::Max(0.05f, UpSpeed / Gravity + FMath::Sqrt(2.0f * (ApexZ - LandZ) / Gravity));
+	FVector Velocity = (Land - Start) / FlightSeconds;
+	Velocity.Z = UpSpeed;
+	Velocity = Velocity.GetClampedToMaxSize(Settings->MaxLaunchSpeed);
+
+	FActiveLaunch& Launch = ActiveLaunches.Add(Handle);
+	Launch.Velocity = Velocity;
+	Launch.LandZ = LandZ;
+	Launch.bLandZFromTrace = bTargetGround;
+	Launch.bLeap = true;
+	const FVector Facing = (Land - Start).GetSafeNormal2D();
+	if (!Facing.IsNearlyZero())
+	{
+		UnitTransform.SetRotation(FQuat(FRotator(0.0f, Facing.Rotation().Yaw, 0.0f)));
+	}
+
+	// Held for the flight like any launch (TickLaunches re-arms it); bLeaping swaps the stun clip for the leap clip.
+	State->bLeaping = true;
+	FMassUnitStatusEffect Hold;
+	Hold.StatusTag = UE::MassUnitSystem::Tags::StatusLaunched();
+	Hold.Duration = LaunchFlightHoldSeconds;
+	Hold.bStuns = true;
+	Hold.MoveSpeedMultiplier = 0.0f;
+	ApplyUnitStatus(UnitHandle, Hold);
+
+	OnUnitLeapt.Broadcast(UnitHandle, Land);
+	return true;
+}
+
 void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 {
 	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_TickLaunches);
+	if (!PendingDeathFalls.IsEmpty())
+	{
+		// Corpses of flyers: a launch with the velocity they died with (a nudge down when hovering), so the corpse
+		// flight, landing trace and settle are the launch system's. Past MaxAirborneUnits the corpse stays where it is.
+		const TArray<TTuple<FMassUnitEntityHandle, FVector, float>> Falls = MoveTemp(PendingDeathFalls);
+		PendingDeathFalls.Reset();
+		for (const TTuple<FMassUnitEntityHandle, FVector, float>& Fall : Falls)
+		{
+			const FMassUnitHandle Unit(Fall.Get<0>());
+			if (IsUnitAirborne(Unit))
+			{
+				// Something already launched the corpse after the kill (a kill fling, a blast, a pile collapse): keep that
+				// flight, only make sure it comes down to the floor rather than at its launch height.
+				CapLaunchLandingHeight(Unit, Fall.Get<2>());
+				continue;
+			}
+			const FVector DeathVelocity = Fall.Get<1>();
+			const FVector FallVelocity = DeathVelocity.IsNearlyZero(1.0f) ? FVector(0.0f, 0.0f, -10.0f) : DeathVelocity;
+			if (LaunchUnit(Unit, FallVelocity, nullptr, false))
+			{
+				// No ground under the landing point within the trace: come down to the group's floor, not mid-air.
+				CapLaunchLandingHeight(Unit, Fall.Get<2>());
+			}
+		}
+	}
 	if (ActiveLaunches.IsEmpty() || !EntitySubsystem)
 	{
 		return;
@@ -1411,7 +1739,7 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 		FActiveLaunch& Launch = It->Value;
 		FMassUnitTransformFragment* Transform = EntityManager.IsEntityValid(Handle)
 			? EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle) : nullptr;
-		const FMassUnitStateFragment* State = Transform ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle) : nullptr;
+		FMassUnitStateFragment* State = Transform ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle) : nullptr;
 		if (!Transform || !State)
 		{
 			It.RemoveCurrent();
@@ -1423,6 +1751,7 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 		if (!Launch.bDead && State->CurrentState == EMassUnitState::Dead)
 		{
 			Launch.bDead = true;
+			State->bLeaping = false;
 			StartCorpseTumble(Launch, Handle);
 			PendingRagdollRequests.Emplace(FMassUnitEntityHandle(Handle), Launch.Velocity);
 			OnUnitLaunched.Broadcast(FMassUnitHandle(FMassUnitEntityHandle(Handle)), Launch.Velocity, true);
@@ -1489,6 +1818,15 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 			Launch.SettleTime = 0.0f;
 			Launch.SettleFrom = UnitTransform.GetRotation();
 			Launch.Yaw = UnitTransform.Rotator().Yaw;
+			continue;
+		}
+
+		// A pounce lands on its feet: no knockdown, the unit is free to act at once.
+		if (Launch.bLeap)
+		{
+			It.RemoveCurrent();
+			State->bLeaping = false;
+			RemoveUnitStatus(Unit, UE::MassUnitSystem::Tags::StatusLaunched());
 			continue;
 		}
 

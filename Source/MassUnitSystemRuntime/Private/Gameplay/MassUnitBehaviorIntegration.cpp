@@ -178,6 +178,16 @@ void UMassUnitBehaviorIntegration::UpdateBlackboardFromEntity(FMassUnitEntityHan
 	}
 }
 
+namespace MassUnitBehavior
+{
+	/** A unit under orders (UMassUnitCommandSystem) takes no movement target from its blackboard. */
+	static bool IsUnderOrders(const FMassEntityManager& EntityManager, const FMassEntityHandle& Handle)
+	{
+		const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle);
+		return Crowd && Crowd->bCommanded;
+	}
+}
+
 void UMassUnitBehaviorIntegration::UpdateEntityFromBlackboard(FMassUnitEntityHandle Entity)
 {
 	UBlackboardComponent* Blackboard = EntityBBMap.FindRef(Entity);
@@ -198,6 +208,7 @@ void UMassUnitBehaviorIntegration::UpdateEntityFromBlackboard(FMassUnitEntityHan
 		}
 		else if (Blackboard->GetKeyID(TEXT("HasRequestedTarget")) != FBlackboard::InvalidKey
 			&& Blackboard->GetValueAsBool(TEXT("HasRequestedTarget"))
+			&& !MassUnitBehavior::IsUnderOrders(EntityManager, NativeHandle)
 			&& Blackboard->GetKeyID(TEXT("RequestedTargetLocation")) != FBlackboard::InvalidKey)
 		{
 			Target->TargetEntity.Invalidate();

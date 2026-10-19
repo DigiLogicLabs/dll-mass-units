@@ -20,6 +20,10 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
 - 2026-10-16 — The runtime module has a hard `GameplayAbilities` dependency even though GAS use is optional at
   runtime. Splitting it out is an open decision.
 
+- 2026-10-17 — Stacking is support-based, not slot-based: a climber stands on a unit, so a pile can only be as tall as
+  the units under it and collapses by itself when they go. Heights replicate for free in an adopter that sends Location
+  with Z (MetalLegs' crowd records compare the full 3D location).
+
 ## Traps
 
 - Windows is case-insensitive: `docs/prd.md` vs `docs/PRD.md` are one file. Never add a doc differing only by case.
@@ -37,3 +41,40 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
   `docs/crowd_replication_plan.md`; that file lives in the reference adopter, not this repo.
 - 2026-10-16 — Docs consolidated to the standard set; changelog is now root `CHANGELOG.md` (DECISIONS 2026-10-16).
 
+- 2026-10-17 — Never touch Mass fragments in a service's `Deinitialize`: at world teardown the Mass entity manager may
+  already be gone (`Assertion failed: EntityManager`, MassEntitySubsystem.h:36). Just drop the bookkeeping.
+- 2026-10-17 — The same teardown trap hid in `UMassUnitCrowdSystem::Deinitialize` (it unregistered groups, resetting
+  fragments): any world torn down with registered groups could assert. It only surfaced when a test left groups alive.
+- 2026-10-17 — In tests, spawn targets as `ADefaultPawn`, not `APawn`: a bare `APawn` has no root component, so
+  `SpawnActor` ignores the location and it sits at the origin (only the scenario at the origin "works").
+- 2026-10-17 — Registering a crowd group resets every member's crowd fragment, which clears `bStackDriven`: stack AFTER
+  registering, and expect a re-register (preset switch) to drop piles. `AddUnitsToCrowdGroup` resets only the new units.
+- 2026-10-17 — A unit launched with no landing trace (budget spent, tracing off) lands at its LAUNCH height. Anything
+  thrown from above the ground must cap its landing (`CapLaunchLandingHeight`) or it lands mid-air.
+- 2026-10-17 — Commanded units (`UMassUnitCommandSystem`) keep `bCommanded` across `FMassUnitCrowdFragment::Reset()` on
+  purpose: a group re-register must not drop orders. Only `ReleaseUnits` clears it. The crowd's `ResetCrowdFragment`,
+  pause and disengage never stop a commanded unit. The test world runs no movement processor, so command tests move
+  units by setting their transform and call `TickCommands` with their own clock.
+- 2026-10-17 — `UMassUnitCommandSystem` queues `OnMoveOrderFinished` and flushes at the end of each public call / tick:
+  never broadcast from inside the `Entries` loop or while holding an entry pointer (a Blueprint "on arrival, issue next
+  waypoint" listener re-enters). Other systems that write unit targets (`UFormationSystem`, BT integration, adopter
+  `SetUnitDestination` callers) must skip `bCommanded` units or they wipe order paths every frame.
+- 2026-10-17 — Look rolls quantise the seed to a byte on purpose: adopters replicate the seed as one byte, and a full-float
+  roll on the server would differ from the client's. `RollLook` must keep drawing the same count of random values per
+  roll (`PickWeighted` always draws one, even for an empty list) or editing a part reshuffles every other part.
+- 2026-10-17 — Mass fragments are NOT scanned by the garbage collector (`FMassEntityManager::AddReferencedObjects` only
+  reports shared fragments). A `UPROPERTY` `TObjectPtr` in a regular fragment does not keep anything alive; the editor
+  hides it (`RF_Standalone`), packaged builds free the asset. Hold such assets elsewhere (`RetainedAssets` on the entity
+  manager) or keep the fragment field weak, like `SourceTemplate`.
+- 2026-10-17 — The project build is unity-batched, so a missing include can compile there and still break adopters:
+  run the standalone `RunUAT BuildPlugin` (non-unity host project) after adding files. It caught `MassUnitStackSystem.cpp`
+  using `FMassUnitVelocityFragment` without `MassUnitCommonFragments.h`.
+- 2026-10-18 — Flyers: the altitude band is relative to ground under the GROUP CENTRE (one trace when the group is
+  registered, reconfigured or moved), not under each unit; a group wandering over a hill higher than its floor clamp
+  can clip into it. While engaged the floor drops to the target's height - 50 so pits stay reachable. The launch landing
+  trace only reaches 1500 cm down; a death fall caps its landing at the band floor when that trace misses.
+- 2026-10-18 — `FMassUnitCrowdFragment::Reset()` (run whenever a unit joins a group) clears the interaction timer but
+  not `EMassUnitState::Interacting`; anything that ends a crowd state must not rely on a fragment timer alone. Engaged
+  flyers measure attack range in 3D, so their hover height is OUTSIDE range: "waiting for a token" for a flyer is the
+  column over the target, not the attack range (see the hover/dive change in the changelog). First flyer/leaper PIE
+  (Testing_MassStress, 10-18): leapers 12 pounces / 12 hits; flyers stayed in band.

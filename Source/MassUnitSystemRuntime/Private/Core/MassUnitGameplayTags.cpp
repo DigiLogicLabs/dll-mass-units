@@ -20,6 +20,10 @@ namespace UE::MassUnitSystem::Tags
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationStun, "MassUnit.Animation.Stun");
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_StatusStunned, "MassUnit.Status.Stunned");
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_StatusLaunched, "MassUnit.Status.Launched");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationClimb, "MassUnit.Animation.Climb");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationHold, "MassUnit.Animation.Hold");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_AnimationLeap, "MassUnit.Animation.Leap");
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_Stacked, "MassUnit.Stacked");
 
 	FGameplayTag UnitTypeDefault() { return TAG_UnitTypeDefault.GetTag(); }
 	FGameplayTag UnitClassSoldier() { return TAG_UnitClassSoldier.GetTag(); }
@@ -34,4 +38,8 @@ namespace UE::MassUnitSystem::Tags
 	FGameplayTag AnimationStun() { return TAG_AnimationStun.GetTag(); }
 	FGameplayTag StatusStunned() { return TAG_StatusStunned.GetTag(); }
 	FGameplayTag StatusLaunched() { return TAG_StatusLaunched.GetTag(); }
+	FGameplayTag AnimationClimb() { return TAG_AnimationClimb.GetTag(); }
+	FGameplayTag AnimationHold() { return TAG_AnimationHold.GetTag(); }
+	FGameplayTag AnimationLeap() { return TAG_AnimationLeap.GetTag(); }
+	FGameplayTag Stacked() { return TAG_Stacked.GetTag(); }
 }

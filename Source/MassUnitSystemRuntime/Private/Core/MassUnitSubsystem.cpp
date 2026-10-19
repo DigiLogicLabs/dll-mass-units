@@ -11,7 +11,9 @@
 #include "Entity/MassUnitEntityManager.h"
 #include "Gameplay/GASUnitIntegration.h"
 #include "Gameplay/MassUnitBehaviorIntegration.h"
+#include "Gameplay/MassUnitCommandSystem.h"
 #include "Gameplay/MassUnitCrowdSystem.h"
+#include "Gameplay/MassUnitStackSystem.h"
 #include "Gameplay/UnitGameplayEventSystem.h"
 #include "MassEntitySubsystem.h"
 #include "Navigation/FormationSystem.h"
@@ -42,6 +44,12 @@ void UMassUnitSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	CrowdSystem = NewObject<UMassUnitCrowdSystem>(this);
 	CrowdSystem->Initialize(GetWorld(), EntitySubsystem, UnitManager, NavigationSystem);
 
+	StackSystem = NewObject<UMassUnitStackSystem>(this);
+	StackSystem->Initialize(GetWorld(), EntitySubsystem, UnitManager, CrowdSystem);
+
+	CommandSystem = NewObject<UMassUnitCommandSystem>(this);
+	CommandSystem->Initialize(GetWorld(), EntitySubsystem, UnitManager, NavigationSystem, StackSystem);
+
 	NiagaraSystem = NewObject<UNiagaraUnitSystem>(this);
 	NiagaraSystem->Initialize(GetWorld(), EntitySubsystem);
 
@@ -63,6 +71,14 @@ void UMassUnitSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UMassUnitSubsystem::Deinitialize()
 {
+	if (CommandSystem)
+	{
+		CommandSystem->Deinitialize();
+	}
+	if (StackSystem)
+	{
+		StackSystem->Deinitialize();
+	}
 	if (CrowdSystem)
 	{
 		CrowdSystem->Deinitialize();
@@ -100,6 +116,8 @@ void UMassUnitSubsystem::Deinitialize()
 		UnitManager->Deinitialize();
 	}
 
+	CommandSystem = nullptr;
+	StackSystem = nullptr;
 	GameplayEventSystem = nullptr;
 	BehaviorIntegration = nullptr;
 	CrowdSystem = nullptr;
@@ -123,6 +141,8 @@ DECLARE_DWORD_COUNTER_STAT(TEXT("Skeletal Mesh Units"), STAT_MassUnit_SkeletalMe
 DECLARE_DWORD_COUNTER_STAT(TEXT("Ragdolls"), STAT_MassUnit_Ragdolls, STATGROUP_MassUnitSystem);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Render Instances"), STAT_MassUnit_RenderInstances, STATGROUP_MassUnitSystem);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Crowd Groups"), STAT_MassUnit_CrowdGroups, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Stacked Units"), STAT_MassUnit_StackedUnits, STATGROUP_MassUnitSystem);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Commanded Units"), STAT_MassUnit_CommandedUnits, STATGROUP_MassUnitSystem);
 
 void UMassUnitSubsystem::Tick(float DeltaTime)
 {
@@ -138,6 +158,23 @@ void UMassUnitSubsystem::Tick(float DeltaTime)
 	}
 	// Airborne units (knockback, kill flings): one sparse loop, free with nothing in the air.
 	UnitManager->TickLaunches(DeltaTime);
+	// Piles: the planner is per group and interval-gated; the stack table is sparse and free when empty.
+	if (StackSystem)
+	{
+		if (const UWorld* World = GetWorld())
+		{
+			StackSystem->UpdatePiles(World->GetTimeSeconds());
+		}
+		StackSystem->TickStacks(DeltaTime);
+	}
+	// Orders: arrival / stuck / knocked-away checks, interval-gated and free with nobody under orders.
+	if (CommandSystem)
+	{
+		if (const UWorld* World = GetWorld())
+		{
+			CommandSystem->TickCommands(World->GetTimeSeconds());
+		}
+	}
 
 	if (FormationSystem)
 	{
@@ -178,6 +215,8 @@ void UMassUnitSubsystem::Tick(float DeltaTime)
 	const UCrowdInstanceRenderer* Renderer = NiagaraSystem ? NiagaraSystem->GetCrowdInstanceRenderer() : nullptr;
 	MASSUNIT_SET_COUNTER(STAT_MassUnit_RenderInstances, RenderInstances, Renderer ? Renderer->GetLiveInstanceCount() : 0);
 	MASSUNIT_SET_COUNTER(STAT_MassUnit_CrowdGroups, CrowdGroups, CrowdSystem ? CrowdSystem->GetCrowdGroupCount() : 0);
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_StackedUnits, StackedUnits, StackSystem ? StackSystem->GetStackedUnitCount() : 0);
+	MASSUNIT_SET_COUNTER(STAT_MassUnit_CommandedUnits, CommandedUnits, CommandSystem ? CommandSystem->GetCommandedUnitCount() : 0);
 }
 
 TStatId UMassUnitSubsystem::GetStatId() const

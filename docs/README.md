@@ -6,6 +6,7 @@ Start here. Everything a contributor (human or AI) needs, in reading order.
 |---|---|
 | [PRD.md](PRD.md) | Why this exists, who it's for, requirements (IDs + status), non-goals |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Modules, classes, data flow, extension points |
+| [unit_composition.md](unit_composition.md) | The goal (one minion, many purposes, looks and attitudes), the layers, swarm types, and the roadmap for them |
 | [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) | Install and every use case, step by step; debugging; troubleshooting |
 | [TESTING.md](TESTING.md) | Build, automation tests, manual and network checks, recorded results |
 | [ROADMAP.md](ROADMAP.md) | What ships in which release; open validation work |
