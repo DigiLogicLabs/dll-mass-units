@@ -9,7 +9,7 @@ Input: a feature request.
 4. Design: fragments/tags, processors (which phase, which query), subsystem API, templates/settings,
    Blueprint exposure, debug visualisation, cost at 1k / 10k units and when idle, which budget bounds it,
    behaviour on a dedicated server and in split-screen, what an adopter would replicate.
-5. Tests: which `MassUnitSystem.*` automation tests and which manual checks in `docs/TESTING.md`.
+5. Tests: which `DLLMassUnits.*` automation tests and which manual checks in `docs/TESTING.md`.
 6. Docs + memory: which files change (changelog, architecture, DECISIONS, MEMORY, TESTING).
 7. Risks, and what would make you choose differently.
 

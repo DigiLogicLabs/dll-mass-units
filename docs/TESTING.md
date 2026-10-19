@@ -7,7 +7,7 @@
 
 ```powershell
 & "<UE>\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin `
-  "-Plugin=<repo>\MassUnitSystem.uplugin" "-Package=<short temp>\mu_pkg" -TargetPlatforms=Win64 -Rocket
+  "-Plugin=<repo>\DLLMassUnits.uplugin" "-Package=<short temp>\mu_pkg" -TargetPlatforms=Win64 -Rocket
 # or, with UE_ENGINE_PATH set:  build_plugin.bat [OutputDir] [Platform] [Configuration]
 #                               UE_ENGINE_PATH=/path/to/UE ./build_plugin.sh [out] [platform] [config]
 ```
@@ -18,34 +18,34 @@ only one UnrealBuildTool may run per engine install.
 
 ## 2. Automation tests
 
-All tests live in `Source/MassUnitSystemEditor/Private/Tests/` (prefix `MassUnitSystem.`; `DLLMassUnits.` after
-the rename). They build their own world, so they need no map or content.
+All tests live in `Source/DLLMassUnitsEditor/Private/Tests/` (prefix `DLLMassUnits.`; run them all with
+`Automation RunTests DLLMassUnits`). They build their own world, so they need no map or content.
 
 | Test | Covers |
 |---|---|
-| `MassUnitSystem.Core.NativeMassLifecycle` | Native entity creation, independent fragments, health/healing, spatial queries, combat, path fallback/cancellation, navmesh-height planar and free-3D movement, formations, managed subgroups, one ambient and one engagement corridor with zero per-unit requests, pause/resume, interactions, interaction/damage activation, moving-target follow, attack requests, ISM custom data, asset-free defaults, stable ISM updates, destruction, world teardown |
-| `MassUnitSystem.Crowd.CollectiveBehavior` | Alerts recruit in range only, morale shock routs and units flee, fear, threat retargeting with hysteresis, damage engages groups, groups without the config keep old behaviour |
-| `MassUnitSystem.Units.StatusAndTags` | Hierarchical template tags, DoT ticks and expiry, stuns and slows apply and lift, immunity, refresh and stacking, cleanse by parent tag, death clears statuses |
-| `MassUnitSystem.Units.AnimationContract` | VAT clip fallbacks, clip-table validation, per-swing restart, impact delay |
-| `MassUnitSystem.Units.Launch` | Launch refusal (scale 0, immunity), flight, knockdown duration, corpse tumble/bounce/settle, ragdoll request, events |
-| `MassUnitSystem.Units.PresentationReplication` | Variant seeds, `GetUnitPresentation` swing counter, `ApplyPresentationState` (no damage queued, corpses never revived) |
-| `MassUnitSystem.Spawner.PatternLayouts` | Every spawn pattern, and parity between spawner layouts and the static helpers |
-| `MassUnitSystem.Spawner.BatchSpawn` | Null-template batch, per-unit transforms, team override and team index cleanup, seeded variants, `MaxUnits` clipping |
-| `MassUnitSystem.Units.Stacking` | Climbing onto supports, stack levels and roles, supports frozen, cascade collapse when a support dies or is launched |
-| `MassUnitSystem.Crowd.MotionStyles` | Wander, Flock, Swarm and Hive ambient movement; `AddUnitsToCrowdGroup` without a reset |
-| `MassUnitSystem.Crowd.StackedAttackers` | Units in a pile attack too, on their own token pool |
-| `MassUnitSystem.Units.Commands` | Move orders in formation, stop, hold, release, `OnMoveOrderFinished`, crowd hand-off |
-| `MassUnitSystem.Units.Looks` | Seed-rolled body variants, parts, scale and tint; byte-precision determinism |
-| `MassUnitSystem.Units.Attitudes` | Seed-rolled pace, attack rhythm, tempo, courage and climb willingness |
-| `MassUnitSystem.Crowd.BehaviorPresets` | Registering from a preset, swapping a live group's preset |
-| `MassUnitSystem.Crowd.SwarmTypes` | Ground and Air swarm types, the altitude band and its destinations, determinism, flyer death falls, hover-or-dive while engaged |
-| `MassUnitSystem.Units.Leap` | `LeapUnit` arc and landing, refusals, a knockback mid-leap, pounces limited by the token pool and landing hits |
+| `DLLMassUnits.Core.NativeMassLifecycle` | Native entity creation, independent fragments, health/healing, spatial queries, combat, path fallback/cancellation, navmesh-height planar and free-3D movement, formations, managed subgroups, one ambient and one engagement corridor with zero per-unit requests, pause/resume, interactions, interaction/damage activation, moving-target follow, attack requests, ISM custom data, asset-free defaults, stable ISM updates, destruction, world teardown |
+| `DLLMassUnits.Crowd.CollectiveBehavior` | Alerts recruit in range only, morale shock routs and units flee, fear, threat retargeting with hysteresis, damage engages groups, groups without the config keep old behaviour |
+| `DLLMassUnits.Units.StatusAndTags` | Hierarchical template tags, DoT ticks and expiry, stuns and slows apply and lift, immunity, refresh and stacking, cleanse by parent tag, death clears statuses |
+| `DLLMassUnits.Units.AnimationContract` | VAT clip fallbacks, clip-table validation, per-swing restart, impact delay |
+| `DLLMassUnits.Units.Launch` | Launch refusal (scale 0, immunity), flight, knockdown duration, corpse tumble/bounce/settle, ragdoll request, events |
+| `DLLMassUnits.Units.PresentationReplication` | Variant seeds, `GetUnitPresentation` swing counter, `ApplyPresentationState` (no damage queued, corpses never revived) |
+| `DLLMassUnits.Spawner.PatternLayouts` | Every spawn pattern, and parity between spawner layouts and the static helpers |
+| `DLLMassUnits.Spawner.BatchSpawn` | Null-template batch, per-unit transforms, team override and team index cleanup, seeded variants, `MaxUnits` clipping |
+| `DLLMassUnits.Units.Stacking` | Climbing onto supports, stack levels and roles, supports frozen, cascade collapse when a support dies or is launched |
+| `DLLMassUnits.Crowd.MotionStyles` | Wander, Flock, Swarm and Hive ambient movement; `AddUnitsToCrowdGroup` without a reset |
+| `DLLMassUnits.Crowd.StackedAttackers` | Units in a pile attack too, on their own token pool |
+| `DLLMassUnits.Units.Commands` | Move orders in formation, stop, hold, release, `OnMoveOrderFinished`, crowd hand-off |
+| `DLLMassUnits.Units.Looks` | Seed-rolled body variants, parts, scale and tint; byte-precision determinism |
+| `DLLMassUnits.Units.Attitudes` | Seed-rolled pace, attack rhythm, tempo, courage and climb willingness |
+| `DLLMassUnits.Crowd.BehaviorPresets` | Registering from a preset, swapping a live group's preset |
+| `DLLMassUnits.Crowd.SwarmTypes` | Ground and Air swarm types, the altitude band and its destinations, determinism, flyer death falls, hover-or-dive while engaged |
+| `DLLMassUnits.Units.Leap` | `LeapUnit` arc and landing, refusals, a knockback mid-leap, pounces limited by the token pool and landing hits |
 
-Run in editor: *Tools → Session Frontend → Automation* (or *Tools → Test Automation*), filter `MassUnitSystem`.
+Run in editor: *Tools → Session Frontend → Automation* (or *Tools → Test Automation*), filter `DLLMassUnits`.
 Headless:
 
 ```powershell
-UnrealEditor-Cmd.exe <Project>.uproject -ExecCmds="Automation RunTests MassUnitSystem; Quit" -unattended -nullrhi -nosplash
+UnrealEditor-Cmd.exe <Project>.uproject -ExecCmds="Automation RunTests DLLMassUnits; Quit" -unattended -nullrhi -nosplash
 ```
 
 If the first tick crashes with `-nullrhi` (seen on some UE 5.7.2 installs), use `-RenderOffscreen` instead.
@@ -73,9 +73,9 @@ tick, so drive time explicitly (as the launch and collective tests do).
 | Item | Result |
 |---|---|
 | 1.4.0 package | UAT `BuildPlugin` UE 5.7: Editor Development, Game Development, Game Shipping, UHT all succeeded (2026-07-14) |
-| 1.4.0 automation | `MassUnitSystem.Core.NativeMassLifecycle` from the packaged plugin: 1 pass, 0 warnings, 0 errors |
+| 1.4.0 automation | The `Core.NativeMassLifecycle` test from the packaged plugin: 1 pass, 0 warnings, 0 errors |
 | 1.4.0 PIE | In the reference adopter: 25 cubes traversed a hill within 5.74 cm of terrain + 50 cm; one shared engagement corridor, zero per-unit path requests, attack requests (transient PIE, 2026-07-14) |
-| Unreleased automation | 2026-10-16, reference adopter (MetalLegs), Development editor, headless: all 8 `MassUnitSystem.*` tests `Success`, `EXIT CODE: 0` |
-| Unreleased automation (2026-10-18) | Reference adopter (MetalLegs), Development editor, headless `MassUnitSystem+MetalLegs.Combat.Crowd+MetalLegs.MassStress`: 28/28 `Success` (all `MassUnitSystem.*` tests above) |
+| Unreleased automation | 2026-10-16, reference adopter (MetalLegs), Development editor, headless: all 8 plugin automation tests `Success`, `EXIT CODE: 0` |
+| Unreleased automation (2026-10-18) | Reference adopter (MetalLegs), Development editor, headless plugin tests + `MetalLegs.Combat.Crowd` + `MetalLegs.MassStress`: 28/28 `Success` (all plugin tests above) |
 | Unreleased standalone build | 2026-10-18: `RunUAT BuildPlugin` `BUILD SUCCESSFUL` (swarm types, flyers, leapers) |
 | Unreleased PIE / network | UNTESTED in this repo |

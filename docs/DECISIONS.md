@@ -141,3 +141,19 @@ without any hit-detection pass. Leaps are a separate event (`OnUnitLeapt`) so ad
 a knockdown do not floor their client puppets.
 **Rejected:** a separate leap processor (second airborne integrator); damage at take-off (undodgeable); a pounce that
 ignores tokens (every unit in range jumps together).
+
+## 2026-10-19 — Tier B applied: folder/plugin/module names follow the dll-* standard; class names kept
+
+**Decision:** The 2026-10-15 rename (Tier B) is applied: folder `Plugins/dll-mass-units`, `DLLMassUnits.uplugin`,
+modules `DLLMassUnitsRuntime` / `DLLMassUnitsEditor`, export macros `DLLMASSUNITSRUNTIME_API` /
+`DLLMASSUNITSEDITOR_API`, settings section `[/Script/DLLMassUnitsRuntime.MassUnitSystemSettings]`, automation test
+prefix `DLLMassUnits.*`. Class, struct, enum and file names, the `UE::MassUnitSystem` namespace, the `MassUnit.*` tag
+root, processor group names, `stat MassUnitSystem` and `LogMassUnitSystem` keep their names. Supersedes the "owed"
+status of the 2026-10-15 entry.
+**Reason:** One naming scheme across every dll-* plugin (what adopters see in the Plugins window, `Build.cs` and the
+test tree). Class names are what adopters' assets and code serialise, so keeping them means assets keep loading with
+two package redirects and adopter C++ only changes its `Build.cs` line. The redirects and the full upgrade steps are in
+[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names); the CHANGELOG carries the
+breaking-change note.
+**Rejected:** renaming classes as well (breaks every adopter's assets for cosmetics); keeping the pre-standard
+module names (the plugin would stay the odd one out in the dll-* family).

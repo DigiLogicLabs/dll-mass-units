@@ -3,7 +3,7 @@ applyTo: "Source/**/Tests/**"
 ---
 # Testing rules (DLL Mass Units)
 
-- Test names: `MassUnitSystem.<Area>.<Behaviour>` (`DLLMassUnits.*` after the rename); flags
+- Test names: `DLLMassUnits.<Area>.<Behaviour>`; flags
   `EditorContext | EngineFilter`.
 - Tests must run in **any** project: use only the plugin's own tags, default settings and transient objects
   (the engine-cube fallback needs no assets).

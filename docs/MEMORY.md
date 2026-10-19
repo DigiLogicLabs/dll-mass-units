@@ -78,3 +78,9 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
   flyers measure attack range in 3D, so their hover height is OUTSIDE range: "waiting for a token" for a flyer is the
   column over the target, not the attack range (see the hover/dive change in the changelog). First flyer/leaper PIE
   (Testing_MassStress, 10-18): leapers 12 pounces / 12 hits; flyers stayed in band.
+- 2026-10-19 — ~~Pending rename~~ Tier B applied (supersedes the 2026-10-16 "still the pre-standard ones" line):
+  folder `dll-mass-units`, `DLLMassUnits.uplugin`, modules `DLLMassUnitsRuntime` / `DLLMassUnitsEditor`, ini section
+  `[/Script/DLLMassUnitsRuntime.*]`, tests `DLLMassUnits.*`. Class names, `stat MassUnitSystem`, `LogMassUnitSystem`
+  and file names like `Core/MassUnitSystemRuntime.h` did not change, so don't "fix" them. Adopters need the package
+  redirects in [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names). Source
+  files all carry the Apache SPDX header (checked 2026-10-19: none still read "All Rights Reserved").

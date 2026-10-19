@@ -2,7 +2,7 @@
 setlocal
 
 set "PLUGIN_ROOT=%~dp0"
-set "PLUGIN_FILE=%PLUGIN_ROOT%MassUnitSystem.uplugin"
+set "PLUGIN_FILE=%PLUGIN_ROOT%DLLMassUnits.uplugin"
 set "OUTPUT_PATH=%~1"
 set "TARGET_PLATFORM=%~2"
 set "BUILD_CONFIG=%~3"

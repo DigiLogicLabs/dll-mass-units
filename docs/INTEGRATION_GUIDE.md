@@ -7,7 +7,7 @@ Simulation*). Defaults quoted here are the C++ defaults.
 ## 1. Install
 
 1. Clone or copy the repo below your project's `Plugins/` folder. The folder name is free; Unreal finds the
-   plugin by `MassUnitSystem.uplugin`, which must sit directly inside that folder.
+   plugin by `DLLMassUnits.uplugin`, which must sit directly inside that folder.
    ```powershell
    git clone https://github.com/DigiLogicLabs/dll-mass-units.git Plugins/dll-mass-units
    ```
@@ -18,17 +18,16 @@ Simulation*). Defaults quoted here are the C++ defaults.
 ## 2. Enable and depend on it
 
 - Enable **DLL Mass Units** (category *Digi Logic Labs*) in **Edit > Plugins**, or add
-  `{ "Name": "MassUnitSystem", "Enabled": true }` to the `.uproject`. The descriptor has `EnabledByDefault: false`
+  `{ "Name": "DLLMassUnits", "Enabled": true }` to the `.uproject`. The descriptor has `EnabledByDefault: false`
   and turns on the engine plugins `MassGameplay`, `Niagara` and `GameplayAbilities`.
 - C++ modules that call the API add the runtime module:
   ```csharp
-  PublicDependencyModuleNames.Add("MassUnitSystemRuntime");
+  PublicDependencyModuleNames.Add("DLLMassUnitsRuntime");
   ```
 - Nothing to construct: `UMassUnitSubsystem` creates itself in Game, PIE and Game Preview worlds. Get it with
   `UMassUnitSubsystem::Get(WorldContextObject)` (Blueprint: *Get Mass Unit Subsystem*). It does not exist in
   editor asset worlds and is not a Game Instance subsystem. Do not run the Mass processors by hand.
-- After the planned rename the names become `DLLMassUnits` / `DLLMassUnitsRuntime`; adopters then add the
-  `[CoreRedirects]` listed in [`AGENTS.md`](../AGENTS.md#pending-rename-tier-b--not-done-yet).
+- Upgrading from 1.4.x (older plugin/module names)? See [section 17](#17-migrating-from-14x-pre-rename-module-names).
 
 ## 3. First run: place a spawner (no assets)
 
@@ -385,3 +384,27 @@ back to Attack); `FMassUnitPlayerEngagementConfig::bEnablePounce` makes engaged 
 `PounceMinRange`-`PounceMaxRange`, holding an attack token through the flight; a landing within `PounceHitRadius` is one
 attack (`PounceDamageMultiplier`). Replicating leaps to clients is the adopter's job (bind `OnUnitLeapt`). Design and
 roadmap: [unit_composition.md](unit_composition.md) section 4.
+
+## 17. Migrating from 1.4.x (pre-rename module names)
+
+Releases up to 1.4.x used the pre-standard names. The plugin, its modules and its export macros now follow the
+dll-* standard; **class names, the `UE::MassUnitSystem` namespace and the `MassUnit.*` tag root did not change**, so
+Blueprints and data assets keep loading once the redirects below are in place. With the editor closed:
+
+1. `.uproject`: rename the plugin entry from `MassUnitSystem` to `DLLMassUnits`
+   (`{ "Name": "DLLMassUnits", "Enabled": true }`).
+2. `Build.cs`: replace the dependency `"MassUnitSystemRuntime"` with `"DLLMassUnitsRuntime"` (and
+   `"MassUnitSystemEditor"` with `"DLLMassUnitsEditor"` if you referenced it). Code that used the
+   `MASSUNITSYSTEMRUNTIME_API` macro uses `DLLMASSUNITSRUNTIME_API`.
+3. Config: rename ini sections `[/Script/MassUnitSystemRuntime.*]` to `[/Script/DLLMassUnitsRuntime.*]` (for example
+   `[/Script/DLLMassUnitsRuntime.MassUnitSystemSettings]`).
+4. Add to `Config/DefaultEngine.ini` so serialized references to the old script packages resolve:
+   ```ini
+   [CoreRedirects]
+   +PackageRedirects=(OldName="/Script/MassUnitSystemRuntime",NewName="/Script/DLLMassUnitsRuntime")
+   +PackageRedirects=(OldName="/Script/MassUnitSystemEditor",NewName="/Script/DLLMassUnitsEditor")
+   ```
+5. Automation tests moved from `MassUnitSystem.<Area>.<Test>` to `DLLMassUnits.<Area>.<Test>`; update CI filters
+   (`Automation RunTests DLLMassUnits`).
+6. Regenerate project files, do a full build, then open the editor and resave assets if you want to drop the
+   redirects later.

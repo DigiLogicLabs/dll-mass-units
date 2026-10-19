@@ -2,12 +2,13 @@
 
 **Large crowds of lightweight units on Unreal Engine's native Mass Entity framework.** Open source
 (Apache-2.0) by [Digi Logic Labs](https://digilogiclabs.com) ([GitHub](https://github.com/DigiLogicLabs)). Built for, and developed alongside, our own
-UE games. Formerly `ue5-mass-units-plugin`; the old GitHub URL redirects.
+UE games.
 
 > **Status: 1.4.0 (stable foundation), UE 5.7.** Core simulation, rendering, crowds and player engagement are
 > released; collective behaviour, statuses, launches, vertex-animation clips and batch spawning are in
-> *Unreleased* ([CHANGELOG](CHANGELOG.md)). The plugin does not replicate units, ships no art, and is still
-> named `MassUnitSystem` until the planned `DLLMassUnits` rename ([ROADMAP](docs/ROADMAP.md)).
+> *Unreleased* ([CHANGELOG](CHANGELOG.md)). The plugin does not replicate units and ships no art.
+> Upgrading from 1.4.x? The plugin and module names changed; see
+> [Migrating from 1.4.x](docs/INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names).
 
 ## Why
 
@@ -34,9 +35,9 @@ representation.
 
 1. Clone into your project's `Plugins/` folder:
    `git clone https://github.com/DigiLogicLabs/dll-mass-units.git Plugins/dll-mass-units`
-2. Enable **DLL Mass Units** in the Plugins window (or add `"MassUnitSystem"` to your `.uproject`). It enables
+2. Enable **DLL Mass Units** in the Plugins window (or add `"DLLMassUnits"` to your `.uproject`). It enables
    the engine plugins `MassGameplay`, `Niagara` and `GameplayAbilities`.
-3. C++ users: add `"MassUnitSystemRuntime"` to your module's `Build.cs` dependencies.
+3. C++ users: add `"DLLMassUnitsRuntime"` to your module's `Build.cs` dependencies.
 
 Tested with **Unreal Engine 5.7.2** (Win64 Editor, Development and Shipping). It is a source plugin, so a
 Blueprint-only project still needs a C++ toolchain to compile it.
@@ -89,8 +90,8 @@ Copilot all read it); the session workflow is in [docs/AI_WORKFLOW.md](docs/AI_W
 
 ## Tests
 
-Automation tests live under `MassUnitSystem.*` (`DLLMassUnits.*` after the rename): Session Frontend →
-Automation, or `-ExecCmds="Automation RunTests MassUnitSystem; Quit"`. Details in [docs/TESTING.md](docs/TESTING.md).
+Automation tests live under `DLLMassUnits.*`: Session Frontend →
+Automation, or `-ExecCmds="Automation RunTests DLLMassUnits; Quit"`. Details in [docs/TESTING.md](docs/TESTING.md).
 
 ## Sister plugins
 

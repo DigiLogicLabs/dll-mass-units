@@ -71,7 +71,7 @@ AnimToTexture pass. They must share the clip table (same frame layout). Rigid pr
 | G1 | GAS seam audit: tag-driven ability selection per unit, attribute-to-native mapping documented end to end | reuse across GAS projects |
 | P1 | Look/attitude previews in the editor (roll N seeds in a viewport) | designers see variety before PIE |
 
-Each item lands with code, a test under `MassUnitSystem.*`, a changelog line and, for choices, a DECISIONS entry.
+Each item lands with code, a test under `DLLMassUnits.*`, a changelog line and, for choices, a DECISIONS entry.
 
 ## 4. Swarm types (adopter goal, 2026-10-18)
 
@@ -103,8 +103,8 @@ Rules: locomotion is opt-in per template (default Ground, existing units unchang
 like the stack and launch tables; clients get poses from the existing crowd record plus at most a few bits.
 
 Status 2026-10-18: **T0 built** (`UMassUnitSwarmType`, `SpawnSwarm`) and **T1 built in part** (altitude band, floor
-clamp, hover-then-dive, death fall; test `MassUnitSystem.Crowd.SwarmTypes`). Not yet: a bob, flying clips, a flyer mesh,
+clamp, hover-then-dive, death fall; test `DLLMassUnits.Crowd.SwarmTypes`). Not yet: a bob, flying clips, a flyer mesh,
 PIE and cost measurements.
 
-Status 2026-10-18 (later): **T2 built** - `LeapUnit` + engagement pounce (test `MassUnitSystem.Units.Leap`). Not yet:
+Status 2026-10-18 (later): **T2 built** - `LeapUnit` + engagement pounce (test `DLLMassUnits.Units.Leap`). Not yet:
 a Leap clip, PIE, replication of leaps to adopters' clients (`OnUnitLeapt` is the hook).

@@ -4,12 +4,12 @@
 
 | Module | Type | Depends on | Holds |
 |---|---|---|---|
-| `MassUnitSystemRuntime` | Runtime | Core, CoreUObject, Engine, MassEntity, MassCommon, MassSimulation, GameplayAbilities, GameplayTags, GameplayTasks, NavigationSystem, AIModule, Niagara, DeveloperSettings (private: Projects, RenderCore) | Everything that ships in a game |
-| `MassUnitSystemEditor` | Editor | Runtime, UnrealEd, MassEntity, GameplayTags, Slate | Automation tests (`Private/Tests/`) |
+| `DLLMassUnitsRuntime` | Runtime | Core, CoreUObject, Engine, MassEntity, MassCommon, MassSimulation, GameplayAbilities, GameplayTags, GameplayTasks, NavigationSystem, AIModule, Niagara, DeveloperSettings (private: Projects, RenderCore) | Everything that ships in a game |
+| `DLLMassUnitsEditor` | Editor | Runtime, UnrealEd, MassEntity, GameplayTags, Slate | Automation tests (`Private/Tests/`) |
 
-Engine plugins enabled by the descriptor: `MassGameplay`, `Niagara`, `GameplayAbilities`. Module and plugin
-names change in the planned rename (`DLLMassUnitsRuntime` / `DLLMassUnitsEditor`); class names do not
-([DECISIONS.md](DECISIONS.md) 2026-10-15).
+Engine plugins enabled by the descriptor: `MassGameplay`, `Niagara`, `GameplayAbilities`. Plugin and module
+names follow the dll-* standard; class names, the `UE::MassUnitSystem` namespace, processor group names and
+`stat MassUnitSystem` kept their pre-standard names ([DECISIONS.md](DECISIONS.md) 2026-10-15, 2026-10-19).
 
 ## Ownership
 

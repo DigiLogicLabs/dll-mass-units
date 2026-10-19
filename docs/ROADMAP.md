@@ -23,9 +23,10 @@ Released history is in [CHANGELOG.md](../CHANGELOG.md). Version numbers below ar
 - [ ] Bump `.uplugin` `VersionName`, tag `v1.5.0`
 
 ## 2.0.0 — dll-* standard rename (breaking: plugin and module names)
-- [ ] `MassUnitSystem.uplugin` → `DLLMassUnits.uplugin`; modules → `DLLMassUnitsRuntime` / `DLLMassUnitsEditor`;
-      export macros; test prefix `DLLMassUnits.*`. Class names unchanged; `[CoreRedirects]` migration note.
-      Done in one pass with the editor closed ([DECISIONS.md](DECISIONS.md) 2026-10-15).
+- [x] Plugin `DLLMassUnits.uplugin`; modules `DLLMassUnitsRuntime` / `DLLMassUnitsEditor`; export macros;
+      test prefix `DLLMassUnits.*`. Class names unchanged; `[CoreRedirects]` migration note in
+      [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names)
+      (applied 2026-10-19, [DECISIONS.md](DECISIONS.md) 2026-10-19).
 - [ ] `dll.MassUnits.*` CVars (at least `dll.MassUnits.Debug`, wired to the visual-debug toggles; today the
       settings flag `bEnableDebugVisualization` is unused).
 - [ ] Decide and, if accepted, split GAS into an optional `DLLMassUnitsGAS` module.

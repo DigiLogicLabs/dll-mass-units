@@ -1,13 +1,27 @@
 # Changelog
 
-All notable changes to DLL Mass Units (plugin `MassUnitSystem`). Format:
+All notable changes to DLL Mass Units (plugin `DLLMassUnits`). Format:
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning: [SemVer](https://semver.org/).
 Release dates come from the commit that set the `.uplugin` `VersionName`.
 
 ## [Unreleased]
 
 Targeted as 1.5.0. Part of this work was first listed under a "1.5.0" heading, but that version was never
-tagged and `MassUnitSystem.uplugin` still reads `1.4.0`.
+tagged and the `.uplugin` still reads `1.4.0`.
+
+### Changed - dll-* standard rename (2026-10-19; breaking for C++ and project config)
+- Plugin and module renamed to the dll-* standard: folder `dll-mass-units`, descriptor `MassUnitSystem.uplugin` →
+  `DLLMassUnits.uplugin` (`.uproject` plugin entry `MassUnitSystem` → `DLLMassUnits`), modules
+  `MassUnitSystemRuntime` / `MassUnitSystemEditor` → `DLLMassUnitsRuntime` / `DLLMassUnitsEditor`, export macros
+  `MASSUNITSYSTEMRUNTIME_API` / `MASSUNITSYSTEMEDITOR_API` → `DLLMASSUNITSRUNTIME_API` / `DLLMASSUNITSEDITOR_API`,
+  settings section `[/Script/MassUnitSystemRuntime.MassUnitSystemSettings]` →
+  `[/Script/DLLMassUnitsRuntime.MassUnitSystemSettings]`. Breaking for C++ (`Build.cs` dependency) and project config;
+  Blueprint assets keep loading with the `[CoreRedirects]` in
+  [INTEGRATION_GUIDE "Migrating from 1.4.x"](docs/INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names).
+- Class, struct, enum and file names, the `UE::MassUnitSystem` namespace, the `MassUnit.*` tag root,
+  `stat MassUnitSystem` and `LogMassUnitSystem` are unchanged.
+- Automation test prefix `MassUnitSystem.*` → `DLLMassUnits.*` (`Automation RunTests DLLMassUnits`). Test names
+  quoted in older entries below use the old prefix.
 
 ### Added - swarm work (2026-10-17 to 2026-10-18; each part lists its own fixes and tests)
 

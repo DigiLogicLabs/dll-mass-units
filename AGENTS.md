@@ -5,12 +5,12 @@ human contributors. `CLAUDE.md` and `.github/copilot-instructions.md` point here
 
 ## What this repo is
 
-An open-source (Apache-2.0) Unreal Engine 5 plugin by Digi Logic Labs (repo `DigiLogicLabs/dll-mass-units`,
-formerly `ue5-mass-units-plugin`; the old URL redirects): large crowds of lightweight units on the native
+An open-source (Apache-2.0) Unreal Engine 5 plugin by Digi Logic Labs (repo `DigiLogicLabs/dll-mass-units`):
+large crowds of lightweight units on the native
 **Mass Entity** framework, with no Actor or UObject per unit. Movement (planar / free 3D), teams, lightweight
 combat and native health, formations, batched navigation, budgeted behaviour LOD, instanced rendering with a
 bounded skeletal-mesh near band, and an optional Gameplay Ability System seam. Version and verified engine:
-`MassUnitSystem.uplugin` and `README.md`.
+`DLLMassUnits.uplugin` and `README.md`.
 
 ## Read before non-trivial work
 
@@ -20,18 +20,18 @@ bounded skeletal-mesh near band, and an optional Gameplay Ability System seam. V
 4. [docs/MEMORY.md](docs/MEMORY.md) — verified facts and traps
 5. [CHANGELOG.md](CHANGELOG.md) — what changed, *Unreleased* first
 
-## Layout (current names — see "Pending rename")
+## Layout
 
 ```
-MassUnitSystem.uplugin
-Source/MassUnitSystemRuntime/      runtime module
+DLLMassUnits.uplugin
+Source/DLLMassUnitsRuntime/        runtime module (export macro DLLMASSUNITSRUNTIME_API)
   Public/Config/                   UMassUnitSystemSettings (Project Settings, "Mass Unit System")
   Public/Core/                     UMassUnitSubsystem (UTickableWorldSubsystem: the one crowd tick), gameplay tags
   Public/Entity/                   fragments, processors, entity manager, spawner, UUnitTemplate
   Public/Gameplay/                 crowd system, formations, GAS and Behavior Tree integration
   Public/Navigation/               batched navigation
   Public/Visual/                   instance renderer, Niagara unit system, skeletal mesh pool
-Source/MassUnitSystemEditor/       editor module + automation tests (Private/Tests, MassUnitSystem.*)
+Source/DLLMassUnitsEditor/         editor module + automation tests (Private/Tests, DLLMassUnits.*)
 docs/                              knowledge graph
 .github/instructions, .github/prompts   tool-agnostic rules and task workflows
 .claude/commands, .claude/agents   Claude Code wrappers + a read-only reviewer
@@ -57,31 +57,16 @@ build_plugin.bat / build_plugin.sh standalone RunUAT BuildPlugin wrappers
    for cost. No per-frame logging. A `dll.MassUnits.*` CVar set is owed by the standard.
 7. **Non-destructive.** Public API (`UFUNCTION`, `UPROPERTY`, public headers) is additive between minors;
    breaking changes need a changelog migration note and a DECISIONS entry. Renames use `[CoreRedirects]`.
-8. **Testable logic, honest status.** Automation tests under `MassUnitSystem.*` (`DLLMassUnits.*` after the
-   rename). Never claim "compiles" or "tested" without an artifact. `UNTESTED` is valid.
+8. **Testable logic, honest status.** Automation tests under `DLLMassUnits.*`. Never claim "compiles" or "tested" without an artifact. `UNTESTED` is valid.
 9. **Only our content.** Never add marketplace or licensed third-party assets.
 
-## Pending rename (Tier B — not done yet)
+## Naming
 
-| Now | After |
-|---|---|
-| folder `Plugins/ue5-mass-units-plugin/` | `Plugins/dll-mass-units/` |
-| `MassUnitSystem.uplugin` | `DLLMassUnits.uplugin` |
-| modules `MassUnitSystemRuntime` / `MassUnitSystemEditor` | `DLLMassUnitsRuntime` / `DLLMassUnitsEditor` |
-| `MASSUNITSYSTEMRUNTIME_API` / `MASSUNITSYSTEMEDITOR_API` | `DLLMASSUNITSRUNTIME_API` / `DLLMASSUNITSEDITOR_API` |
-
-**Class names stay** (`UMassUnitSubsystem`, `UUnitTemplate`, ...): renaming classes breaks every adopter's assets
-for no benefit. After the rename, adopters add to `DefaultEngine.ini`:
-
-```ini
-[CoreRedirects]
-+PackageRedirects=(OldName="/Script/MassUnitSystemRuntime",NewName="/Script/DLLMassUnitsRuntime")
-+PackageRedirects=(OldName="/Script/MassUnitSystemEditor",NewName="/Script/DLLMassUnitsEditor")
-```
-
-and rename config sections `[/Script/MassUnitSystemRuntime.*]` to `[/Script/DLLMassUnitsRuntime.*]`, the
-`.uproject` plugin entry (`MassUnitSystem` to `DLLMassUnits`) and `Build.cs` module names. Do it with the editor
-closed, then a full build.
+Plugin, folder and module names follow the dll-* standard (`dll-mass-units`, `DLLMassUnits`,
+`DLLMassUnitsRuntime` / `DLLMassUnitsEditor`). **Class names stay** (`UMassUnitSubsystem`, `UUnitTemplate`, ...),
+as do the `UE::MassUnitSystem` namespace, the `MassUnit.*` tag root, `stat MassUnitSystem` and
+`LogMassUnitSystem`: renaming classes breaks every adopter's assets for no benefit. Adopters upgrading from an
+older release follow [docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md#17-migrating-from-14x-pre-rename-module-names).
 
 ## Coding conventions
 
@@ -100,9 +85,9 @@ closed, then a full build.
 
 ```powershell
 # Standalone build (proves no hidden dependency on any game); or: build_plugin.bat <out> Win64 Development
-& "<UE>\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin "-Plugin=<repo>\MassUnitSystem.uplugin" "-Package=<short temp>\pkg" -TargetPlatforms=Win64 -Rocket
+& "<UE>\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin "-Plugin=<repo>\DLLMassUnits.uplugin" "-Package=<short temp>\pkg" -TargetPlatforms=Win64 -Rocket
 # Tests (inside any project that has the plugin)
-UnrealEditor-Cmd.exe <Project>.uproject -ExecCmds="Automation RunTests MassUnitSystem; Quit" -unattended -nullrhi
+UnrealEditor-Cmd.exe <Project>.uproject -ExecCmds="Automation RunTests DLLMassUnits; Quit" -unattended -nullrhi
 ```
 
 Keep `-Package` on a short path (Windows 260-character limit). Only one UnrealBuildTool can run per engine

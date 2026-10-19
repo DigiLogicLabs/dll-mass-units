@@ -114,7 +114,7 @@ Priority: **P0** required, **P1** should, **P2** could. Status: **Done** (releas
 | Navigation | Zero per-unit path requests for a default crowd group. |
 | Network | Zero bytes replicated by the plugin. |
 | Scale | Budgets hold at 1,000+ units; measured per target platform, never promised by `MaxUnits`. |
-| Openness | Every release builds standalone and passes `MassUnitSystem.*`. |
+| Openness | Every release builds standalone and passes `DLLMassUnits.*`. |
 
 ## 7. Constraints
 
