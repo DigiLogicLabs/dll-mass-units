@@ -751,6 +751,13 @@ void UMassUnitStackSystem::UpdatePiles(float CurrentTime)
 		{
 			continue;
 		}
+		// Flyers (a Free 3D group with an altitude band) never pile, whatever their template allows.
+		float BandGroundZ = 0.0f, BandFloorZ = 0.0f, BandCeilingZ = 0.0f;
+		if (CrowdSystem->GetCrowdGroupAltitudeBand(GroupHandle, BandGroundZ, BandFloorZ, BandCeilingZ))
+		{
+			NextTime = CurrentTime + FMath::Max(5.0f, Settings->PilePlanInterval);
+			continue;
+		}
 
 		// The group's stack config: the first template that can stack. A group with none backs off for a while, so
 		// adopters without stacking templates pay almost nothing.

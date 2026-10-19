@@ -99,3 +99,29 @@ them would make every group setting per-unit (cost and authoring burden). Multip
 source of truth for balance. Tempo applies to looping clips only so attack impact delays stay matched to their clips.
 **Rejected:** per-unit copies of crowd configs; random jitter at runtime (non-deterministic, unreplicable); attitude in
 the crowd fragment (crowd resets would erase it).
+
+## 2026-10-18 — A swarm type is a bundle of existing layers plus locomotion; flyers are a band on Free 3D groups
+
+**Decision:** `UMassUnitSwarmType` only chooses existing layers (template, look, attitude, behaviour preset) and adds one
+axis, `EMassUnitLocomotion`. Air does not get its own simulation: it is the existing Free 3D crowd mode plus an altitude
+band in `FMassUnitCrowdConfig` (destinations clamped into the band, a per-unit floor clamp in the movement processor,
+hover-then-dive when engaged) and a corpse fall through the launch system on death.
+**Reason:** The adopter wants many swarm kinds (flyers, crawlers, climbers, ankle biters) with slightly different
+behaviour; most of that variety already exists as data. Reusing Free 3D and the launch table keeps flyers at zero new
+per-unit tables and zero per-unit traces (the ground is one trace per group). The band lives on the crowd config so any
+Free 3D group (swimmers later) can use it without a swarm type.
+**Rejected:** a flyer subclass or processor (duplicates crowd logic); per-unit ground traces for altitude (cost at
+crowd scale; terrain under a moving group is approximated by the ground under its centre, refreshed when the centre
+moves); locomotion on `UUnitTemplate` (one template could not both walk and fly).
+
+## 2026-10-18 — A pounce is a leap on the launch table plus an attack token, resolved on landing
+
+**Decision:** Leapers jump with `LeapUnit`, an entry in the existing sparse launch table flagged `bLeap` (held for the
+flight, own clip, no knockdown). The crowd system starts pounces from engaged units in a range window only when an attack
+token is free, and lands the hit on touchdown through the same `RequestActorAttack` seam as a swing.
+**Reason:** Reusing the launch table keeps flight cost, the airborne cap and landing traces in one place; the token keeps
+MaxSimultaneousAttackers meaningful (a pack does not all jump at once); resolving on landing means a dodged pounce misses
+without any hit-detection pass. Leaps are a separate event (`OnUnitLeapt`) so adopters that replay `OnUnitLaunched` as
+a knockdown do not floor their client puppets.
+**Rejected:** a separate leap processor (second airborne integrator); damage at take-off (undodgeable); a pounce that
+ignores tokens (every unit in range jumps together).

@@ -161,6 +161,34 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Planar2D && bConformToNavmeshHeight", ForceUnits = "cm"))
 	float NavigationHeightOffset = 50.0f;
 
+	/**
+	 * Free 3D only (flyers): keep the group in a height band over the ground under its centre. Ambient destinations are
+	 * picked inside the band, units never sink below the band's floor, and an engaged group hovers over its target while
+	 * waiting for an attack token and dives at it from above. Off = Free 3D as before (a sphere around the centre).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D"))
+	bool bUseAltitudeBand = false;
+
+	/** Lowest ambient height over the ground under the group centre. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D && bUseAltitudeBand", ClampMin = "0.0", ForceUnits = "cm"))
+	float MinAltitude = 150.0f;
+
+	/** Highest ambient height over the ground under the group centre. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D && bUseAltitudeBand", ClampMin = "0.0", ForceUnits = "cm"))
+	float MaxAltitude = 600.0f;
+
+	/** Engaged units waiting for an attack token circle this high over the target. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D && bUseAltitudeBand", ClampMin = "0.0", ForceUnits = "cm"))
+	float EngagedHoverHeight = 250.0f;
+
+	/** Units never move below ground + this (a cheap per-unit clamp in the movement processor, no traces). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D && bUseAltitudeBand", ClampMin = "0.0", ForceUnits = "cm"))
+	float FloorClearance = 30.0f;
+
+	/** A unit that dies in the air falls to the ground as a corpse (the launch system's corpse flight) instead of hanging there. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Movement|Altitude", meta = (EditCondition = "MovementMode == EMassUnitCrowdMovementMode::Free3D && bUseAltitudeBand"))
+	bool bFallWhenKilled = true;
+
 	/** Deterministically partitions a large group for spatial variation and aggregated presentation cues. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crowd|Subgroups")
 	bool bEnableManagedSubgroups = true;
@@ -370,6 +398,39 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitPlayerEngagementConfig
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && MaxSimultaneousAttackers > 0", ClampMin = "0", UIMax = "24"))
 	int32 ExtraAttackersWhileStacked = 8;
+
+	/**
+	 * Leapers: an engaged unit between Pounce Min Range and Pounce Max Range of the target, with a free attack token,
+	 * jumps at it (UMassUnitEntityManager::LeapUnit) instead of only running in. Landing within Pounce Hit Radius of
+	 * the target lands one hit (the normal attack request, damage x Pounce Damage Multiplier). Planar groups only.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks"))
+	bool bEnablePounce = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "0.0", ForceUnits = "cm"))
+	float PounceMinRange = 300.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "0.0", ForceUnits = "cm"))
+	float PounceMaxRange = 800.0f;
+
+	/** Seconds between one unit's pounces (each unit rolls 75-125% of it). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "0.1", ForceUnits = "s"))
+	float PounceCooldown = 4.0f;
+
+	/** How high the jump arcs over the higher of start and landing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "10.0", ForceUnits = "cm"))
+	float PounceArcHeight = 150.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "0.0"))
+	float PounceDamageMultiplier = 1.5f;
+
+	/** No pounce at a target this much higher or lower than the unit (rooftops, pits). A clear line to it is also required. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "0.0", ForceUnits = "cm"))
+	float PounceMaxHeightDelta = 200.0f;
+
+	/** A pounce hits when it lands this close to the target (2D; within 250 cm in height). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Pounce", meta = (EditCondition = "bEnableAttacks && bEnablePounce", ClampMin = "1.0", ForceUnits = "cm"))
+	float PounceHitRadius = 160.0f;
 
 	/** Where token-less units wait, as a multiple of attack range. Must exceed one or they attack anyway. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Engagement|Combat", meta = (EditCondition = "bEnableAttacks && MaxSimultaneousAttackers > 0", ClampMin = "1.05", ClampMax = "4.0"))
@@ -639,6 +700,14 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdStats
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
 	int32 AttacksRequested = 0;
 
+	/** Pounces started since the crowd system started (engagement bEnablePounce). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
+	int32 TotalPouncesStarted = 0;
+
+	/** Pounces that landed on their target since the crowd system started. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
+	int32 TotalPounceHits = 0;
+
 	/** Units currently holding an attack token. Bounded by MaxSimultaneousAttackers when that is non-zero. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crowd|Engagement")
 	int32 ActiveAttackers = 0;
@@ -786,6 +855,24 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Presets")
 	UMassUnitBehaviorPreset* GetCrowdGroupPreset(int32 CrowdGroupHandle) const;
 
+	/**
+	 * RegisterCrowdGroupFromPreset with the crowd config replaced by Crowd (engagement and collective behaviour still come
+	 * from Preset, and the group still reports Preset). Used by UMassUnitSwarmType to make a preset fly. Preset may be
+	 * null: the group then has Crowd only, with no engagement or collective behaviour.
+	 * Trap: ApplyCrowdGroupPreset(Group, GetCrowdGroupPreset(Group)) installs Preset->Crowd and so drops the override (a
+	 * flying swarm lands). Re-apply a swarm type's MakeCrowdConfig() with SetCrowdGroupConfig instead.
+	 */
+	int32 RegisterCrowdGroupFromPresetWithCrowd(const TArray<FMassUnitHandle>& UnitHandles, FVector Center, UMassUnitBehaviorPreset* Preset,
+		const FMassUnitCrowdConfig& Crowd);
+
+	/**
+	 * A Free 3D group's altitude band (FMassUnitCrowdConfig::bUseAltitudeBand) in world Z: the ground under the group
+	 * centre (one trace when the group is registered, reconfigured or moved; the centre's Z when nothing is hit), the
+	 * floor no unit goes below and the band's ceiling. False when the group does not exist or has no band.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd")
+	bool GetCrowdGroupAltitudeBand(int32 CrowdGroupHandle, float& OutGroundZ, float& OutFloorZ, float& OutCeilingZ) const;
+
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd")
 	bool IsCrowdGroupRegistered(int32 CrowdGroupHandle) const;
 
@@ -839,7 +926,13 @@ public:
 	AActor* GetCrowdGroupTargetActor(int32 CrowdGroupHandle) const;
 
 	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Crowd|Diagnostics")
-	FMassUnitCrowdStats GetCrowdStats() const { return LastStats; }
+	FMassUnitCrowdStats GetCrowdStats() const
+	{
+		FMassUnitCrowdStats Stats = LastStats;
+		Stats.TotalPouncesStarted = TotalPouncesStarted;
+		Stats.TotalPounceHits = TotalPounceHits;
+		return Stats;
+	}
 
 	/**
 	 * The point a Flock group follows or a Swarm group orbits (false for other styles, an unknown group, or before the
@@ -990,6 +1083,8 @@ private:
 	{
 		int32 Handle = INDEX_NONE;
 		FVector Center = FVector::ZeroVector;
+		/** Ground under Center for the altitude band (Free 3D + bUseAltitudeBand only). */
+		float AltitudeGroundZ = 0.0f;
 		FMassUnitCrowdConfig Config;
 		/** Preset last registered or applied (query only; its values are copied into the configs). */
 		TWeakObjectPtr<UMassUnitBehaviorPreset> Preset;
@@ -1116,6 +1211,17 @@ public:
 
 private:
 	TMap<FMassUnitEntityHandle, int32> UnitToGroup;
+	/** A pounce in the air: resolved (hit or miss) once its unit has landed. Sparse: only units mid-pounce. */
+	struct FPendingPounce
+	{
+		int32 GroupHandle = INDEX_NONE;
+		float Damage = 0.0f;
+	};
+	TMap<FMassUnitEntityHandle, FPendingPounce> PendingPounces;
+	int32 TotalPouncesStarted = 0;
+	int32 TotalPounceHits = 0;
+	/** Lands the hits of pounces whose units have touched down (start of every engagement update). */
+	void ResolvePounces();
 	FTimerHandle UpdateTimer;
 	FMassUnitCrowdStats LastStats;
 	int32 NextGroupHandle = 1;
@@ -1241,6 +1347,14 @@ private:
 	/** Direct (or, when allowed and the group navigates, navmesh) destination for a styled unit. */
 	bool AssignMotionDestination(FMassUnitEntityHandle Entity, FCrowdGroup& Group, const FVector& Destination, bool bAllowNavmesh);
 	FVector PickMotionWaypoint(FCrowdGroup& Group) const;
+	/** True for a Free 3D group with an altitude band. */
+	static bool UsesAltitudeBand(const FCrowdGroup& Group);
+	/** Ground Z under Center (WorldStatic trace), or Center.Z when nothing is hit. */
+	float ResolveAltitudeGroundZ(const FVector& Center) const;
+	/** Clamps an ambient destination's Z into the group's altitude band (no-op without a band). */
+	static void ApplyAltitudeBand(const FCrowdGroup& Group, FVector& Destination);
+	/** Copies the group's altitude floor and fall-when-killed flag into a unit's crowd fragment. */
+	static void ApplyAltitudeToFragment(const FCrowdGroup& Group, FMassUnitCrowdFragment& Crowd);
 	bool UpdateEngagedUnit(const FSpatialEntry& Entry, FCrowdGroup& Group, float CurrentTime, bool bForceDecision);
 	bool RefreshSharedNavigationPath(FCrowdGroup& Group, float CurrentTime, bool bForceRefresh = false);
 	FVector CalculateSharedPathDestination(const FSpatialEntry& Entry, const FCrowdGroup& Group) const;

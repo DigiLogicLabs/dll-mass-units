@@ -67,6 +67,7 @@ void UMassUnitCrowdSystem::Deinitialize()
 	Groups.Reset();
 	UnitToGroup.Reset();
 	PendingSignals.Reset();
+	PendingPounces.Reset();
 	LastStats = {};
 	NavigationSystem = nullptr;
 	UnitManager = nullptr;
@@ -92,6 +93,7 @@ int32 UMassUnitCrowdSystem::RegisterCrowdGroup(
 	Group.Config = SanitizeConfig(Config);
 	Group.bUseNavigation = bUseNavigation;
 	Group.AcceptanceRadius = FMath::Max(1.0f, AcceptanceRadius);
+	Group.AltitudeGroundZ = UsesAltitudeBand(Group) ? ResolveAltitudeGroundZ(Center) : Center.Z;
 
 	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
 	const float CurrentTime = World->GetTimeSeconds();
@@ -119,6 +121,7 @@ int32 UMassUnitCrowdSystem::RegisterCrowdGroup(
 			&& !Crowd->bUse3DMovement
 			&& Group.Config.bConformToNavmeshHeight;
 		Crowd->NavigationHeightOffset = Group.Config.NavigationHeightOffset;
+		ApplyAltitudeToFragment(Group, *Crowd);
 		Crowd->GroupHandle = Group.Handle;
 		Crowd->SubgroupIndex = Group.Config.bEnableManagedSubgroups
 			? ValidUnitIndex / Group.Config.ManagedSubgroupSize
@@ -181,6 +184,7 @@ int32 UMassUnitCrowdSystem::AddUnitsToCrowdGroup(int32 CrowdGroupHandle, const T
 		Crowd->bUse3DMovement = Group->Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
 		Crowd->bConformToNavmeshHeight = Group->bUseNavigation && !Crowd->bUse3DMovement && Group->Config.bConformToNavmeshHeight;
 		Crowd->NavigationHeightOffset = Group->Config.NavigationHeightOffset;
+		ApplyAltitudeToFragment(*Group, *Crowd);
 		Crowd->GroupHandle = CrowdGroupHandle;
 		Crowd->SubgroupIndex = Group->Config.bEnableManagedSubgroups ? Group->Units.Num() / Group->Config.ManagedSubgroupSize : 0;
 		Crowd->BaseMoveSpeed = State->MoveSpeed;
@@ -261,6 +265,7 @@ bool UMassUnitCrowdSystem::SetCrowdGroupCenter(int32 CrowdGroupHandle, FVector N
 	if (FCrowdGroup* Group = Groups.Find(CrowdGroupHandle))
 	{
 		Group->Center = NewCenter;
+		Group->AltitudeGroundZ = UsesAltitudeBand(*Group) ? ResolveAltitudeGroundZ(NewCenter) : NewCenter.Z;
 		return true;
 	}
 	return false;
@@ -343,6 +348,7 @@ bool UMassUnitCrowdSystem::SetCrowdGroupConfig(int32 CrowdGroupHandle, const FMa
 	Group->bUseNavigation = bUseNavigation;
 	Group->AcceptanceRadius = FMath::Max(1.0f, AcceptanceRadius);
 	Group->Preset.Reset();
+	Group->AltitudeGroundZ = UsesAltitudeBand(*Group) ? ResolveAltitudeGroundZ(Group->Center) : Group->Center.Z;
 	if (bStyleChanged)
 	{
 		Group->bMotionInitialized = false;
@@ -384,10 +390,18 @@ int32 UMassUnitCrowdSystem::RegisterCrowdGroupFromPreset(const TArray<FMassUnitH
 	{
 		return INDEX_NONE;
 	}
-	const int32 Handle = RegisterCrowdGroup(UnitHandles, Center, Preset->Crowd, Preset->bUseNavigation, Preset->AcceptanceRadius);
-	if (Handle == INDEX_NONE)
+	return RegisterCrowdGroupFromPresetWithCrowd(UnitHandles, Center, Preset, Preset->Crowd);
+}
+
+int32 UMassUnitCrowdSystem::RegisterCrowdGroupFromPresetWithCrowd(const TArray<FMassUnitHandle>& UnitHandles, FVector Center,
+	UMassUnitBehaviorPreset* Preset, const FMassUnitCrowdConfig& Crowd)
+{
+	const int32 Handle = Preset
+		? RegisterCrowdGroup(UnitHandles, Center, Crowd, Preset->bUseNavigation, Preset->AcceptanceRadius)
+		: RegisterCrowdGroup(UnitHandles, Center, Crowd, false, 50.0f);
+	if (Handle == INDEX_NONE || !Preset)
 	{
-		return INDEX_NONE;
+		return Handle;
 	}
 	if (Preset->bEnableEngagement)
 	{
@@ -1247,6 +1261,7 @@ void UMassUnitCrowdSystem::UpdateUnit(
 		&& !Crowd->bUse3DMovement
 		&& Group.Config.bConformToNavmeshHeight;
 	Crowd->NavigationHeightOffset = Group.Config.NavigationHeightOffset;
+	ApplyAltitudeToFragment(Group, *Crowd);
 
 	// Under orders (UMassUnitCommandSystem): the crowd only keeps the unit apart from its neighbours. No wander, motion
 	// style, engagement, interaction or sleep touches its destination; releasing the unit hands it back.
@@ -1312,7 +1327,9 @@ void UMassUnitCrowdSystem::UpdateUnit(
 		Crowd->SteeringDirection = FVector::ZeroVector;
 		return;
 	}
-	if (Crowd->InteractionEndTime > 0.0f)
+	// Also ends an interaction whose timer was wiped: joining a group (a preset swap, units moved between groups) resets
+	// the crowd fragment but not the state, which left the unit Interacting, and frozen, forever.
+	if (Crowd->InteractionEndTime > 0.0f || State->CurrentState == EMassUnitState::Interacting)
 	{
 		Crowd->InteractionEndTime = 0.0f;
 		Crowd->InteractionPartner.Invalidate();
@@ -1651,6 +1668,8 @@ bool UMassUnitCrowdSystem::AssignRandomDestination(
 		}
 	}
 
+	ApplyAltitudeBand(Group, Destination);
+
 	const bool bCanUsePlanarNavigation = Group.bUseNavigation
 		&& Group.Config.MovementMode == EMassUnitCrowdMovementMode::Planar2D;
 	const bool bAssigned = bCanUsePlanarNavigation && NavigationSystem
@@ -1680,6 +1699,13 @@ bool UMassUnitCrowdSystem::AssignRandomDestination(
 	{
 		DrawDebugDirectionalArrow(World, CurrentLocation, Destination, 60.0f, FColor::Cyan, false, 1.0f, 0, 1.5f);
 		DrawDebugCircle(World, Group.Center, Group.Config.WanderRadius, 64, FColor::White, false, 1.0f, 0, 1.0f, FVector(1, 0, 0), FVector(0, 1, 0), false);
+		if (UsesAltitudeBand(Group))
+		{
+			// Altitude band: floor (orange) and ceiling (cyan) rings over the ground under the centre.
+			const FVector Ground(Group.Center.X, Group.Center.Y, Group.AltitudeGroundZ);
+			DrawDebugCircle(World, Ground + FVector(0.0f, 0.0f, Group.Config.FloorClearance), Group.Config.WanderRadius, 48, FColor::Orange, false, 1.0f, 0, 1.0f, FVector(1, 0, 0), FVector(0, 1, 0), false);
+			DrawDebugCircle(World, Ground + FVector(0.0f, 0.0f, Group.Config.MaxAltitude), Group.Config.WanderRadius, 48, FColor::Cyan, false, 1.0f, 0, 1.0f, FVector(1, 0, 0), FVector(0, 1, 0), false);
+		}
 	}
 #endif
 	return true;
@@ -1796,9 +1822,55 @@ void UMassUnitCrowdSystem::RemoveUnitFromPreviousGroup(FMassUnitEntityHandle Ent
 	}
 }
 
+void UMassUnitCrowdSystem::ResolvePounces()
+{
+	if (PendingPounces.IsEmpty() || !UnitManager || !EntitySubsystem)
+	{
+		return;
+	}
+	for (auto It = PendingPounces.CreateIterator(); It; ++It)
+	{
+		const FMassUnitEntityHandle Entity = It->Key;
+		const FMassUnitHandle Unit(Entity);
+		if (UnitManager->IsUnitAirborne(Unit))
+		{
+			if (!UnitManager->IsUnitLeaping(Unit))
+			{
+				It.RemoveCurrent();   // knocked out of the leap (a blast, a knockback): the pounce is over
+			}
+			continue;   // still in the air
+		}
+		const FPendingPounce Pounce = It->Value;
+		It.RemoveCurrent();
+		FCrowdGroup* Group = Groups.Find(Pounce.GroupHandle);
+		AActor* TargetActor = Group ? Group->TargetActor.Get() : nullptr;
+		FMassUnitStateFragment State;
+		FTransform Transform;
+		if (!Group || !IsValid(TargetActor) || !UnitManager->GetUnitState(Unit, State) || State.CurrentState == EMassUnitState::Dead
+			|| !UnitManager->GetUnitTransform(Unit, Transform))
+		{
+			continue;   // killed in the air, group gone, or target lost: the pounce whiffs
+		}
+		const FVector Landed = Transform.GetLocation();
+		const FVector TargetLocation = TargetActor->GetActorLocation();
+		if (FVector::DistSquared2D(Landed, TargetLocation) <= FMath::Square(Group->EngagementConfig.PounceHitRadius)
+			&& FMath::Abs(Landed.Z - TargetLocation.Z) <= 250.0f)
+		{
+			RequestActorAttack(Entity, *Group, TargetActor, Pounce.Damage);
+			++TotalPounceHits;
+			// The pounce was this unit's attack: no extra swing the moment it lands.
+			if (FMassUnitStateFragment* LiveState = EntitySubsystem->GetMutableEntityManager().GetFragmentDataPtr<FMassUnitStateFragment>(Entity.ToMassEntityHandle()))
+			{
+				LiveState->AttackCooldownRemaining = FMath::Max(LiveState->AttackCooldownRemaining, LiveState->AttackCooldown);
+			}
+		}
+	}
+}
+
 void UMassUnitCrowdSystem::UpdateGroupEngagements(float CurrentTime)
 {
 	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_CrowdEngagements);
+	ResolvePounces();
 	// Expire tokens once per update for every group. Acquisition also prunes, but that only happens
 	// while somebody is in range; without this pass a group whose units all withdrew would keep
 	// reporting its last holders through ActiveAttackers forever.
@@ -1943,6 +2015,49 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 		&& AttackRange > 0.0f
 		&& DistanceSquared <= FMath::Square(AttackRange);
 
+	// Pounce (leapers): from the range window, a unit that can take an attack token jumps at the target instead of only
+	// running in. The token is held through the flight, so pounces count against MaxSimultaneousAttackers.
+	const FMassUnitPlayerEngagementConfig& Engagement = Group.EngagementConfig;
+	if (Engagement.bEnableAttacks && Engagement.bEnablePounce && !bUse3DMovement && !Crowd->bStackDriven && !bInAttackRange
+		&& CurrentTime >= Crowd->NextPounceTime)
+	{
+		const float Distance = FMath::Sqrt(DistanceSquared);
+		if (Distance >= Engagement.PounceMinRange && Distance <= Engagement.PounceMaxRange
+			&& FMath::Abs(TargetLocation.Z - Entry.Location.Z) <= Engagement.PounceMaxHeightDelta
+			&& TryAcquireAttackToken(Group, Entry.Entity, CurrentTime, 1.5f))
+		{
+			FRandomStream PounceStream = MakeRandomStream(Entry.Entity, Group, Crowd->DecisionSequence++);
+			Crowd->NextPounceTime = CurrentTime + Engagement.PounceCooldown * PounceStream.FRandRange(0.75f, 1.25f);
+			// Land just short of the target (inside the hit radius), not inside it, and never through a wall.
+			const FVector Approach = (Entry.Location - TargetLocation).GetSafeNormal2D();
+			const float ShortBy = FMath::Min(AttackRange * 0.75f, Engagement.PounceHitRadius * 0.75f);
+			const FVector LandPoint = TargetLocation + Approach * ShortBy;
+			const bool bClearLine = !World || !World->LineTraceTestByObjectType(Entry.Location + FVector(0.0f, 0.0f, 50.0f), TargetLocation,
+				FCollisionObjectQueryParams(ECC_WorldStatic), FCollisionQueryParams(SCENE_QUERY_STAT(MassUnitPounceSight), false));
+			if (bClearLine && UnitManager->LeapUnit(FMassUnitHandle(Entry.Entity), LandPoint, Engagement.PounceArcHeight))
+			{
+				FPendingPounce& Pounce = PendingPounces.Add(Entry.Entity);
+				Pounce.GroupHandle = Group.Handle;
+				Pounce.Damage = State->BaseDamage * static_cast<float>(FMath::Max(1, State->UnitLevel))
+					* Engagement.DamageMultiplier * Engagement.PounceDamageMultiplier;
+				++TotalPouncesStarted;
+#if ENABLE_DRAW_DEBUG
+				if (Engagement.bEnableVisualDebug && World)
+				{
+					DrawDebugLine(World, Entry.Location, TargetLocation, FColor::Magenta, false, 1.0f, 0, 2.0f);
+				}
+#endif
+				return true;
+			}
+			// No jump (wall in the way, launches off, airborne cap): give the token back so units in range can swing.
+			Group.AttackTokenExpiry.Remove(Entry.Entity);
+			if (!bClearLine)
+			{
+				Crowd->NextPounceTime = CurrentTime + 0.5f;   // look again soon, without a trace every visit
+			}
+		}
+	}
+
 	// A unit already mid-cooldown keeps its token so it is not displaced by a newcomer between swings.
 	//
 	// The hold must outlast the time until this unit is next visited, not just its attack cooldown.
@@ -1959,6 +2074,15 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 		UpdateInterval * static_cast<float>(FMath::Max(1, UpdatesPerCycle)));
 	const bool bHasAttackToken = bInAttackRange
 		&& TryAcquireAttackToken(Group, Entry.Entity, CurrentTime, TokenHoldDuration);
+
+	// Flyers wait for a token hovering over the target, which is outside the 3D attack range. Measured only in 3D they
+	// would leave "waiting" the moment they rose, dive back into range, find the pool still full and rise again (a
+	// yo-yo). A flyer in the column over the target either reserves a token from there and dives, or keeps hovering.
+	const float StandoffRadius = AttackRange * FMath::Max(1.05f, Engagement.StandoffDistanceMultiplier);
+	const bool bOverTarget = UsesAltitudeBand(Group) && Engagement.bEnableAttacks && AttackRange > 0.0f && !bInAttackRange
+		&& ToTarget.SizeSquared2D() <= FMath::Square(StandoffRadius * 1.5f)
+		&& FMath::Abs(ToTarget.Z) <= Group.Config.EngagedHoverHeight + AttackRange;
+	const bool bDiveToken = bOverTarget && TryAcquireAttackToken(Group, Entry.Entity, CurrentTime, TokenHoldDuration);
 
 	// Attack-state debug. This is the tool for confirming token behaviour with placeholder meshes,
 	// before any attack animation exists: red means swinging, yellow means in range but waiting for a
@@ -2018,15 +2142,15 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 	Crowd->NextFollowUpdateTime = CurrentTime + Group.EngagementConfig.TargetRefreshInterval;
 
 	FVector FollowOffset = CalculateFollowOffset(Entry.Entity, Group);
+	bool bHoverWhileWaiting = false;
 	if (Group.EngagementConfig.bEnableAttacks && AttackRange > 0.0f)
 	{
 		// Units that wanted to attack but found the token pool full wait on a ring outside attack
 		// range instead of pressing in. Without this they crowd the target and shove each other while
 		// permanently unable to swing, which reads far worse than simply waiting a turn.
-		const bool bWaitingForToken = bInAttackRange && !bHasAttackToken;
-		const float MaximumApproachRadius = bWaitingForToken
-			? AttackRange * FMath::Max(1.05f, Group.EngagementConfig.StandoffDistanceMultiplier)
-			: AttackRange * 0.75f;
+		const bool bWaitingForToken = (bInAttackRange && !bHasAttackToken) || (bOverTarget && !bDiveToken);
+		bHoverWhileWaiting = bWaitingForToken;
+		const float MaximumApproachRadius = bWaitingForToken ? StandoffRadius : AttackRange * 0.75f;
 		if (bWaitingForToken)
 		{
 			// Push the unit out to the standoff ring rather than clamping, so it actually backs off.
@@ -2077,6 +2201,13 @@ bool UMassUnitCrowdSystem::UpdateEngagedUnit(
 	if (!bUse3DMovement && !bUseSharedPath)
 	{
 		Destination.Z = Entry.Location.Z;
+	}
+	else if (UsesAltitudeBand(Group))
+	{
+		// Flyers: circle over the target while waiting for an attack token, otherwise close in from above (a dive).
+		Destination.Z = bHoverWhileWaiting
+			? TargetLocation.Z + Group.Config.EngagedHoverHeight
+			: FMath::Max(Destination.Z, TargetLocation.Z);
 	}
 
 	const bool bHasMovementTarget = Target->bHasTargetLocation || Navigation->bPathRequested || Navigation->bPathValid;
@@ -2670,6 +2801,10 @@ FMassUnitCrowdConfig UMassUnitCrowdSystem::SanitizeConfig(const FMassUnitCrowdCo
 	Motion.HiveRadius = FMath::Max(10.0f, Motion.HiveRadius);
 	Motion.ForageChance = FMath::Clamp(Motion.ForageChance, 0.0f, 1.0f);
 	Motion.ForageLingerTime = FMath::Max(0.0f, Motion.ForageLingerTime);
+	Result.MinAltitude = FMath::Max(0.0f, Result.MinAltitude);
+	Result.MaxAltitude = FMath::Max(Result.MinAltitude, Result.MaxAltitude);
+	Result.EngagedHoverHeight = FMath::Max(0.0f, Result.EngagedHoverHeight);
+	Result.FloorClearance = FMath::Clamp(Result.FloorClearance, 0.0f, Result.MinAltitude);
 	return Result;
 }
 
@@ -2700,11 +2835,83 @@ FVector UMassUnitCrowdSystem::PickMotionWaypoint(FCrowdGroup& Group) const
 	FRandomStream Stream(HashCombine(static_cast<uint32>(Group.Config.RandomSeed), static_cast<uint32>(Group.Handle * 7919 + Group.WaypointSequence++)));
 	if (Group.Config.MovementMode == EMassUnitCrowdMovementMode::Free3D)
 	{
-		return Group.Center + Stream.VRand() * (FMath::Pow(Stream.FRand(), 1.0f / 3.0f) * Group.Config.WanderRadius);
+		FVector Waypoint = Group.Center + Stream.VRand() * (FMath::Pow(Stream.FRand(), 1.0f / 3.0f) * Group.Config.WanderRadius);
+		ApplyAltitudeBand(Group, Waypoint);
+		return Waypoint;
 	}
 	const float Angle = Stream.FRandRange(0.0f, 2.0f * UE_PI);
 	const float Radius = FMath::Sqrt(Stream.FRand()) * Group.Config.WanderRadius;
 	return Group.Center + FVector(FMath::Cos(Angle) * Radius, FMath::Sin(Angle) * Radius, 0.0f);
+}
+
+// ================================================================================================
+// ALTITUDE BAND (Free 3D flyers) - ambient destinations in a band, a floor clamp, hover and dive when engaged
+// ================================================================================================
+
+bool UMassUnitCrowdSystem::UsesAltitudeBand(const FCrowdGroup& Group)
+{
+	return Group.Config.bUseAltitudeBand && Group.Config.MovementMode == EMassUnitCrowdMovementMode::Free3D;
+}
+
+float UMassUnitCrowdSystem::ResolveAltitudeGroundZ(const FVector& Center) const
+{
+	if (!World)
+	{
+		return Center.Z;
+	}
+	// One trace per register / reconfigure / move of a group, never per unit. WorldStatic only, so pawns and physics
+	// debris under the centre do not lift the band.
+	FHitResult Hit;
+	const FCollisionObjectQueryParams Objects(ECC_WorldStatic);
+	const FCollisionQueryParams Params(SCENE_QUERY_STAT(MassUnitAltitudeGround), false);
+	if (World->LineTraceSingleByObjectType(Hit, Center + FVector(0.0f, 0.0f, 200.0f), Center - FVector(0.0f, 0.0f, 20000.0f), Objects, Params))
+	{
+		return Hit.ImpactPoint.Z;
+	}
+	return Center.Z;
+}
+
+void UMassUnitCrowdSystem::ApplyAltitudeBand(const FCrowdGroup& Group, FVector& Destination)
+{
+	if (UsesAltitudeBand(Group))
+	{
+		Destination.Z = FMath::Clamp(Destination.Z,
+			Group.AltitudeGroundZ + Group.Config.MinAltitude,
+			Group.AltitudeGroundZ + Group.Config.MaxAltitude);
+	}
+}
+
+void UMassUnitCrowdSystem::ApplyAltitudeToFragment(const FCrowdGroup& Group, FMassUnitCrowdFragment& Crowd)
+{
+	// Units under orders (UMassUnitCommandSystem) follow their order's path heights: a floor relative to the ground under
+	// the group centre would pin a navmesh order above lower path points it must reach.
+	Crowd.bAltitudeFloor = UsesAltitudeBand(Group) && !Crowd.bCommanded;
+	Crowd.bFallWhenKilled = UsesAltitudeBand(Group) && Group.Config.bFallWhenKilled;
+	if (!Crowd.bAltitudeFloor)
+	{
+		Crowd.AltitudeFloorZ = 0.0f;
+		return;
+	}
+	float FloorZ = Group.AltitudeGroundZ + Group.Config.FloorClearance;
+	if (Group.bEngaged)
+	{
+		// A target standing lower than the ground under the centre (a pit, a slope) must still be reachable.
+		FloorZ = FMath::Min(FloorZ, Group.LastTargetLocation.Z - 50.0f);
+	}
+	Crowd.AltitudeFloorZ = FloorZ;
+}
+
+bool UMassUnitCrowdSystem::GetCrowdGroupAltitudeBand(int32 CrowdGroupHandle, float& OutGroundZ, float& OutFloorZ, float& OutCeilingZ) const
+{
+	const FCrowdGroup* Group = Groups.Find(CrowdGroupHandle);
+	if (!Group || !UsesAltitudeBand(*Group))
+	{
+		return false;
+	}
+	OutGroundZ = Group->AltitudeGroundZ;
+	OutFloorZ = Group->AltitudeGroundZ + Group->Config.FloorClearance;
+	OutCeilingZ = Group->AltitudeGroundZ + Group->Config.MaxAltitude;
+	return true;
 }
 
 void UMassUnitCrowdSystem::UpdateGroupMotion(float CurrentTime)
@@ -2840,12 +3047,14 @@ FVector UMassUnitCrowdSystem::CalculateFlocking(
 	return Alignment * Motion.AlignmentWeight + Cohesion * Motion.CohesionWeight;
 }
 
-bool UMassUnitCrowdSystem::AssignMotionDestination(FMassUnitEntityHandle Entity, FCrowdGroup& Group, const FVector& Destination, bool bAllowNavmesh)
+bool UMassUnitCrowdSystem::AssignMotionDestination(FMassUnitEntityHandle Entity, FCrowdGroup& Group, const FVector& InDestination, bool bAllowNavmesh)
 {
 	if (!EntitySubsystem || !UnitManager)
 	{
 		return false;
 	}
+	FVector Destination = InDestination;
+	ApplyAltitudeBand(Group, Destination);
 	const bool bNavmesh = bAllowNavmesh && Group.bUseNavigation && NavigationSystem
 		&& Group.Config.MovementMode == EMassUnitCrowdMovementMode::Planar2D;
 	const bool bAssigned = bNavmesh
@@ -3040,6 +3249,13 @@ FMassUnitPlayerEngagementConfig UMassUnitCrowdSystem::SanitizeEngagementConfig(
 	// Below 1.0 the standoff ring would sit inside attack range, so token-less units would attack anyway.
 	Result.StandoffDistanceMultiplier = FMath::Clamp(Result.StandoffDistanceMultiplier, 1.05f, 4.0f);
 	Result.EngagementSlotCount = FMath::Clamp(Result.EngagementSlotCount, 3, 64);
+	Result.PounceMinRange = FMath::Max(0.0f, Result.PounceMinRange);
+	Result.PounceMaxRange = FMath::Max(Result.PounceMinRange, Result.PounceMaxRange);
+	Result.PounceCooldown = FMath::Max(0.1f, Result.PounceCooldown);
+	Result.PounceArcHeight = FMath::Max(10.0f, Result.PounceArcHeight);
+	Result.PounceDamageMultiplier = FMath::Max(0.0f, Result.PounceDamageMultiplier);
+	Result.PounceHitRadius = FMath::Max(1.0f, Result.PounceHitRadius);
+	Result.PounceMaxHeightDelta = FMath::Max(0.0f, Result.PounceMaxHeightDelta);
 	return Result;
 }
 
@@ -3767,6 +3983,7 @@ bool UMassUnitCrowdSystem::UpdateRoutingUnit(
 		}
 	}
 
+	ApplyAltitudeBand(Group, Destination);   // routed flyers flee sideways inside their band, not up into the sky
 	if (!UnitManager->SetUnitDestination(FMassUnitHandle(Entry.Entity), Destination, Group.AcceptanceRadius))
 	{
 		Crowd->NextFollowUpdateTime = CurrentTime + UpdateInterval;

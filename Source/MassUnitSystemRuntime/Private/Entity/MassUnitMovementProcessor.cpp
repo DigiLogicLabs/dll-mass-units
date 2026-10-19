@@ -84,9 +84,21 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 			{
 				Velocity.Value = FVector::ZeroVector;
 				Force.Value = FVector::ZeroVector;
-				Visual.CurrentAnimation = State.CurrentState == EMassUnitState::Dead
-					? UE::MassUnitSystem::Tags::AnimationDeath()
-					: UE::MassUnitSystem::Tags::AnimationStun();
+				if (State.CurrentState == EMassUnitState::Dead)
+				{
+					Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationDeath();
+				}
+				else if (State.bLeaping)
+				{
+					// A pounce is held like a launch but reads as an attack, not a stun.
+					Visual.CurrentAnimation = MassUnitMovement::TemplateHasClip(Visual, UE::MassUnitSystem::Tags::AnimationLeap())
+						? UE::MassUnitSystem::Tags::AnimationLeap()
+						: UE::MassUnitSystem::Tags::AnimationAttack();
+				}
+				else
+				{
+					Visual.CurrentAnimation = UE::MassUnitSystem::Tags::AnimationStun();
+				}
 				continue;
 			}
 
@@ -194,6 +206,21 @@ void UMassUnitMovementProcessor::Execute(FMassEntityManager& EntityManager, FMas
 			{
 				FTransform& MutableTransform = Transform.GetMutableTransform();
 				MutableTransform.AddToTranslation(Velocity.Value * DeltaTime);
+				// Free 3D altitude band (flyers): never sink below the group's floor. A clamp, not a trace. A floor that rose
+				// (the group stopped chasing a target down in a pit) lifts units at a capped rate instead of teleporting them.
+				if (bUse3DMovement && Crowd->bAltitudeFloor)
+				{
+					FVector Location = MutableTransform.GetLocation();
+					if (Location.Z < Crowd->AltitudeFloorZ)
+					{
+						constexpr float MaxFloorLiftSpeed = 400.0f;   // cm/s
+						// Above the floor before this step: stop at the floor. Already below it (the floor rose): rise gently.
+						const float PreviousZ = Location.Z - Velocity.Value.Z * DeltaTime;
+						Location.Z = FMath::Min(Crowd->AltitudeFloorZ, FMath::Max(Location.Z, PreviousZ) + MaxFloorLiftSpeed * DeltaTime);
+						MutableTransform.SetLocation(Location);
+						Velocity.Value.Z = FMath::Max(0.0f, Velocity.Value.Z);
+					}
+				}
 				const FRotator VelocityRotation = Velocity.Value.Rotation();
 				const FRotator DesiredRotation = bUse3DMovement
 					? VelocityRotation

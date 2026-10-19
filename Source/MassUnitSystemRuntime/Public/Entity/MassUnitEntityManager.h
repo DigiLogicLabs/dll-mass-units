@@ -118,6 +118,11 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
 	bool, bDead);
 
 /** A launched unit touched down (dust, impact sound). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+	FMassUnitLeaptSignature,
+	FMassUnitHandle, UnitHandle,
+	FVector, TargetPoint);
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
 	FMassUnitLandedSignature,
 	FMassUnitHandle, UnitHandle,
@@ -367,6 +372,25 @@ public:
 	 */
 	bool CapLaunchLandingHeight(FMassUnitHandle UnitHandle, float MaxLandZ);
 
+	/**
+	 * Sends a living unit on a jump to TargetPoint (a pounce): a ballistic arc ArcHeight over the higher end, landing on
+	 * the ground under TargetPoint at the unit's own height over the ground (landing traces; same level as the start when
+	 * they miss). The unit is held for the flight (no walking or attacking), plays MassUnit.Animation.Leap (Attack when the
+	 * template has no Leap clip) and lands on its feet with no knockdown; OnUnitLanded fires. Fails for dead, stacked or
+	 * airborne units, when launches are disabled or MaxAirborneUnits is reached. Not broadcast as OnUnitLaunched (that
+	 * would replay as a knockdown on adopters' clients); OnUnitLeapt fires instead.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Mass Unit System|Launch")
+	bool LeapUnit(FMassUnitHandle UnitHandle, FVector TargetPoint, float ArcHeight = 150.0f);
+
+	/** True while the unit is in a LeapUnit jump. */
+	UFUNCTION(BlueprintPure, Category = "Mass Unit System|Launch")
+	bool IsUnitLeaping(FMassUnitHandle UnitHandle) const;
+
+	/** A unit started a LeapUnit jump toward TargetPoint (presentation / replication hook). */
+	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Launch|Events")
+	FMassUnitLeaptSignature OnUnitLeapt;
+
 	UPROPERTY(BlueprintAssignable, Category = "Mass Unit System|Launch|Events")
 	FMassUnitLaunchedSignature OnUnitLaunched;
 
@@ -464,9 +488,17 @@ private:
 		int32 Bounces = 0;
 		bool bDead = false;
 		bool bSettling = false;
+		/** A LeapUnit jump: lands on its feet, no knockdown. */
+		bool bLeap = false;
 	};
 	TMap<FMassEntityHandle, FActiveLaunch> ActiveLaunches;
 	TArray<TPair<FMassUnitEntityHandle, FVector>> PendingRagdollRequests;
+	/**
+	 * Units that died in the air (crowd fragment bFallWhenKilled): velocity at death and the group's altitude floor (the
+	 * landing height when the landing trace finds no ground). Started as corpse falls (LaunchUnit) at the top of the next
+	 * TickLaunches, never from inside the damage call.
+	 */
+	TArray<TTuple<FMassUnitEntityHandle, FVector, float>> PendingDeathFalls;
 
 	/** Launched-status duration that holds a living unit down for any flight; landing swaps it for the knockdown. */
 	static constexpr float LaunchFlightHoldSeconds = 30.0f;

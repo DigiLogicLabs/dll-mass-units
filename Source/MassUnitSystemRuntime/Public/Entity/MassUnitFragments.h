@@ -119,6 +119,10 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitStateFragment : public FMassFragment
 	/** Presentation-only units (client puppets): last replicated swing counter seen, see ApplyPresentationState. */
 	uint8 PresentationSwingCounter = 0;
 
+	/** In a LeapUnit jump (a pounce): held like a launch, but plays the Leap clip and lands on its feet (no knockdown). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mass Unit|State")
+	bool bLeaping = false;
+
 	/** Starts a swing: restarts the attack clip and records the damage to land at the impact delay. */
 	void BeginAttackSwing(float Damage)
 	{
@@ -501,6 +505,16 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdFragment : public FMassFragment
 	 * command system, so Reset() keeps it (a crowd group re-registering does not drop the unit's orders).
 	 */
 	bool bCommanded = false;
+	/**
+	 * Free 3D altitude band (FMassUnitCrowdConfig::bUseAltitudeBand): the movement processor never lets the unit sink
+	 * below AltitudeFloorZ. Refreshed from the group by the crowd system.
+	 */
+	float AltitudeFloorZ = 0.0f;
+	bool bAltitudeFloor = false;
+	/** Engagement pounce (FMassUnitPlayerEngagementConfig::bEnablePounce): world time this unit may pounce again. */
+	float NextPounceTime = 0.0f;
+	/** Dying in the air starts a corpse fall (UMassUnitEntityManager death-fall queue) instead of hanging in place. */
+	bool bFallWhenKilled = false;
 
 	void Reset()
 	{
@@ -526,6 +540,10 @@ struct MASSUNITSYSTEMRUNTIME_API FMassUnitCrowdFragment : public FMassFragment
 		bStackDriven = false;
 		MotionPhase = 0;
 		PresentationStackRole = 0;
+		AltitudeFloorZ = 0.0f;
+		bAltitudeFloor = false;
+		NextPounceTime = 0.0f;
+		bFallWhenKilled = false;
 	}
 };
 

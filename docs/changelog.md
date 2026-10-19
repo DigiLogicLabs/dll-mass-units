@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased - fixes from the first flyer/leaper PIE run
+
+- Fixed: a unit that joined a crowd group mid-interaction (`RegisterCrowdGroup` on units from another group, a preset
+  swap) stayed `Interacting`, and so frozen in place, forever: joining resets the crowd fragment's interaction timer
+  but not the unit state. The ambient update now ends any interaction with no timer. Seen in PIE as 18 of 120 flyers
+  stuck on the ground after a preset swap.
+- Fixed: engaged flyers waiting for an attack token yo-yoed. Hovering at `EngagedHoverHeight` put them outside the 3D
+  attack range, so they stopped waiting, dove back in, found the pool full and climbed again. A flyer in the column
+  over the target (2D within 1.5x the standoff ring, height within hover + attack range) now either reserves a token
+  there and dives, or keeps hovering. A diving flyer holds its token for the dive, so the number of flyers actually
+  swinging can briefly be below `MaxSimultaneousAttackers`.
+- Tests: `MassUnitSystem.Crowd.SwarmTypes` covers hover-while-full and dive-with-a-free-token;
+  `MassUnitSystem.Core.NativeMassLifecycle` covers rejoining a group mid-interaction.
+
+## Unreleased - leapers (pounce)
+
+- `UMassUnitEntityManager::LeapUnit(Unit, TargetPoint, ArcHeight)`: a living unit jumps on a ballistic arc to the ground
+  under a point (its own pivot height kept), held for the flight like a launch but playing `MassUnit.Animation.Leap`
+  (Attack fallback) and landing on its feet with no knockdown. `IsUnitLeaping`, `OnUnitLeapt` (leaps are not broadcast
+  as `OnUnitLaunched`, which adopters replay as knockdowns). Uses the launch table: no new per-unit tick.
+- Engagement pounce: `FMassUnitPlayerEngagementConfig::bEnablePounce`, `PounceMinRange`, `PounceMaxRange`,
+  `PounceCooldown`, `PounceArcHeight`, `PounceDamageMultiplier`, `PounceHitRadius`. An engaged planar unit in the range
+  window takes an attack token and leaps; landing within the hit radius requests one attack (the normal
+  `RequestActorAttack` path). `FMassUnitCrowdStats::TotalPouncesStarted` / `TotalPounceHits`.
+- Fragments: `FMassUnitStateFragment::bLeaping`, `FMassUnitCrowdFragment::NextPounceTime`. Tag `MassUnit.Animation.Leap`.
+- Review fixes (same day): a launch during a leap ends the leap (knockdown on landing, pending pounce dropped);
+  units immune to `MassUnit.Status.Launched` never leap; a landed pounce starts the attack cooldown (no extra swing on
+  touchdown); a refused leap gives its attack token back; pounces land short of the target, need a clear WorldStatic
+  line to it and a height difference within `PounceMaxHeightDelta`, and never start from inside attack range.
+- Test: `MassUnitSystem.Units.Leap`.
+
+## Unreleased - swarm types and flyers
+
+- `UMassUnitSwarmType` (data asset): a kind of swarm as one asset - `Template`, optional `LookProfile` /
+  `AttitudeProfile` overrides, `BehaviorPreset` and `Locomotion` (`EMassUnitLocomotion`: `Ground`, `Air`).
+  `SpawnSwarm(World, Type, Center, Count, Radius, Seed, TeamOverride)` spawns and registers one crowd group;
+  `MakeCrowdConfig()` returns the group config (the preset's, made to fly for Air).
+- Flyers: `FMassUnitCrowdConfig` altitude band for Free 3D groups - `bUseAltitudeBand`, `MinAltitude`, `MaxAltitude`,
+  `EngagedHoverHeight`, `FloorClearance`, `bFallWhenKilled` (all off / unchanged by default). Ambient destinations
+  (wander, motion styles) are clamped into the band over the ground under the group centre (one WorldStatic trace per
+  register / reconfigure / move); the movement processor clamps units above the band floor (no traces); an engaged
+  group circles `EngagedHoverHeight` over its target while waiting for an attack token and closes in from above; a
+  killed flyer starts a corpse fall on the next `TickLaunches` (landing at the band floor when the landing trace misses).
+- `UMassUnitCrowdSystem::RegisterCrowdGroupFromPresetWithCrowd` (C++), `GetCrowdGroupAltitudeBand`.
+- Fragment: `FMassUnitCrowdFragment::AltitudeFloorZ`, `bAltitudeFloor`, `bFallWhenKilled`.
+- Review fixes (same day): a death fall never replaces a launch the kill already started (adopter kill flings, blasts) -
+  it only caps that flight's landing at the floor; a raised floor lifts units at 400 cm/s instead of teleporting them;
+  commanded units skip the floor (navmesh orders reach lower path points); routed flyers flee inside the band; the pile
+  planner skips banded groups (flyers never pile); band floor / ceiling rings in the crowd visual debug.
+- Test: `MassUnitSystem.Crowd.SwarmTypes`.
+
 ## Unreleased - behaviour presets
 
 - `UMassUnitBehaviorPreset` (data asset): a crowd group's whole temperament - `FMassUnitCrowdConfig` (motion style,

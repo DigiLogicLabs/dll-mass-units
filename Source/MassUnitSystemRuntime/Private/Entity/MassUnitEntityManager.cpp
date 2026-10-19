@@ -48,6 +48,7 @@ void UMassUnitEntityManager::Deinitialize()
 	NextStatusTickTime = 0.0f;
 	ActiveLaunches.Reset();
 	PendingRagdollRequests.Reset();
+	PendingDeathFalls.Reset();
 	UnitArchetype = FMassArchetypeHandle();
 	RuntimeDefaultTemplate = nullptr;
 	EntitySubsystem = nullptr;
@@ -590,6 +591,14 @@ bool UMassUnitEntityManager::ApplyDamageInternal(
 	{
 		State->CurrentState = EMassUnitState::Dead;
 		State->StateTime = 0.0f;
+		// Flyers (crowd altitude band): fall as a corpse instead of hanging where they died.
+		const FMassEntityHandle NativeHandle = EntityHandle.ToMassEntityHandle();
+		const FMassUnitCrowdFragment* Crowd = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitCrowdFragment>(NativeHandle);
+		if (Crowd && Crowd->bFallWhenKilled && !ActiveLaunches.Contains(NativeHandle))
+		{
+			const FMassUnitVelocityFragment* Velocity = EntitySubsystem->GetEntityManager().GetFragmentDataPtr<FMassUnitVelocityFragment>(NativeHandle);
+			PendingDeathFalls.Emplace(EntityHandle, Velocity ? Velocity->Value : FVector::ZeroVector, Crowd->AltitudeFloorZ);
+		}
 	}
 
 	if (bDeferEvents && EntitySubsystem && EntitySubsystem->GetWorld())
@@ -1498,6 +1507,9 @@ bool UMassUnitEntityManager::LaunchUnit(FMassUnitHandle UnitHandle, FVector Velo
 	Launch->Bounces = 0;
 	Launch->bSettling = false;
 	Launch->bDead = bDead;
+	// A launch replaces a leap in progress (a knockback mid-pounce): it lands as a launch, with the knockdown.
+	Launch->bLeap = false;
+	State->bLeaping = false;
 	Launch->LandZ = ResolveLandingZ(UnitTransform.GetLocation(), Velocity, Gravity, &Launch->bLandZFromTrace);
 
 	if (bDead)
@@ -1605,9 +1617,108 @@ void UMassUnitEntityManager::StartCorpseTumble(FActiveLaunch& Launch, const FMas
 	Launch.RollRate = Rate * 0.35f * (SeedB * 2.0f - 1.0f);
 }
 
+bool UMassUnitEntityManager::IsUnitLeaping(FMassUnitHandle UnitHandle) const
+{
+	const FActiveLaunch* Launch = UnitHandle.IsValid() ? ActiveLaunches.Find(UnitHandle.EntityHandle.ToMassEntityHandle()) : nullptr;
+	return Launch && Launch->bLeap && !Launch->bDead;
+}
+
+bool UMassUnitEntityManager::LeapUnit(FMassUnitHandle UnitHandle, FVector TargetPoint, float ArcHeight)
+{
+	const UMassUnitSystemSettings* Settings = GetDefault<UMassUnitSystemSettings>();
+	if (!Settings || !Settings->bEnableUnitLaunch || !IsUnitValid(UnitHandle))
+	{
+		return false;
+	}
+	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const FMassEntityHandle Handle = UnitHandle.EntityHandle.ToMassEntityHandle();
+	FMassUnitTransformFragment* Transform = EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle);
+	FMassUnitStateFragment* State = EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle);
+	const FMassUnitCrowdFragment* Crowd = EntityManager.GetFragmentDataPtr<FMassUnitCrowdFragment>(Handle);
+	if (!Transform || !State || State->CurrentState == EMassUnitState::Dead || ActiveLaunches.Contains(Handle)
+		|| (Crowd && Crowd->bStackDriven) || ActiveLaunches.Num() >= Settings->MaxAirborneUnits)
+	{
+		return false;
+	}
+	// Like LaunchUnit: a unit immune to the Launched status cannot be held for the flight, so it would walk and attack
+	// in the air. It does not leap.
+	const FMassUnitAbilityFragment* Ability = EntityManager.GetFragmentDataPtr<FMassUnitAbilityFragment>(Handle);
+	if (Ability && UE::MassUnitSystem::Tags::StatusLaunched().MatchesAny(Ability->StatusImmunityTags))
+	{
+		return false;
+	}
+
+	// Land at the unit's own height over the ground (pivot offset), on the ground under the target point.
+	const float Gravity = FMath::Max(1.0f, Settings->LaunchGravity);
+	FTransform& UnitTransform = Transform->GetMutableTransform();
+	const FVector Start = UnitTransform.GetLocation();
+	bool bStartGround = false;
+	bool bTargetGround = false;
+	const float StartGroundZ = ResolveLandingZ(Start, FVector::ZeroVector, Gravity, &bStartGround);
+	const float TargetGroundZ = ResolveLandingZ(TargetPoint, FVector::ZeroVector, Gravity, &bTargetGround);
+	const float PivotOffset = bStartGround ? Start.Z - StartGroundZ : 0.0f;
+	const float LandZ = bTargetGround ? TargetGroundZ + PivotOffset : Start.Z;
+
+	const FVector Land(TargetPoint.X, TargetPoint.Y, LandZ);
+	const float ApexZ = FMath::Max(Start.Z, LandZ) + FMath::Max(10.0f, ArcHeight);
+	const float UpSpeed = FMath::Sqrt(2.0f * Gravity * (ApexZ - Start.Z));
+	const float FlightSeconds = FMath::Max(0.05f, UpSpeed / Gravity + FMath::Sqrt(2.0f * (ApexZ - LandZ) / Gravity));
+	FVector Velocity = (Land - Start) / FlightSeconds;
+	Velocity.Z = UpSpeed;
+	Velocity = Velocity.GetClampedToMaxSize(Settings->MaxLaunchSpeed);
+
+	FActiveLaunch& Launch = ActiveLaunches.Add(Handle);
+	Launch.Velocity = Velocity;
+	Launch.LandZ = LandZ;
+	Launch.bLandZFromTrace = bTargetGround;
+	Launch.bLeap = true;
+	const FVector Facing = (Land - Start).GetSafeNormal2D();
+	if (!Facing.IsNearlyZero())
+	{
+		UnitTransform.SetRotation(FQuat(FRotator(0.0f, Facing.Rotation().Yaw, 0.0f)));
+	}
+
+	// Held for the flight like any launch (TickLaunches re-arms it); bLeaping swaps the stun clip for the leap clip.
+	State->bLeaping = true;
+	FMassUnitStatusEffect Hold;
+	Hold.StatusTag = UE::MassUnitSystem::Tags::StatusLaunched();
+	Hold.Duration = LaunchFlightHoldSeconds;
+	Hold.bStuns = true;
+	Hold.MoveSpeedMultiplier = 0.0f;
+	ApplyUnitStatus(UnitHandle, Hold);
+
+	OnUnitLeapt.Broadcast(UnitHandle, Land);
+	return true;
+}
+
 void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 {
 	MASSUNIT_SCOPE_CYCLE(STAT_MassUnit_TickLaunches);
+	if (!PendingDeathFalls.IsEmpty())
+	{
+		// Corpses of flyers: a launch with the velocity they died with (a nudge down when hovering), so the corpse
+		// flight, landing trace and settle are the launch system's. Past MaxAirborneUnits the corpse stays where it is.
+		const TArray<TTuple<FMassUnitEntityHandle, FVector, float>> Falls = MoveTemp(PendingDeathFalls);
+		PendingDeathFalls.Reset();
+		for (const TTuple<FMassUnitEntityHandle, FVector, float>& Fall : Falls)
+		{
+			const FMassUnitHandle Unit(Fall.Get<0>());
+			if (IsUnitAirborne(Unit))
+			{
+				// Something already launched the corpse after the kill (a kill fling, a blast, a pile collapse): keep that
+				// flight, only make sure it comes down to the floor rather than at its launch height.
+				CapLaunchLandingHeight(Unit, Fall.Get<2>());
+				continue;
+			}
+			const FVector DeathVelocity = Fall.Get<1>();
+			const FVector FallVelocity = DeathVelocity.IsNearlyZero(1.0f) ? FVector(0.0f, 0.0f, -10.0f) : DeathVelocity;
+			if (LaunchUnit(Unit, FallVelocity, nullptr, false))
+			{
+				// No ground under the landing point within the trace: come down to the group's floor, not mid-air.
+				CapLaunchLandingHeight(Unit, Fall.Get<2>());
+			}
+		}
+	}
 	if (ActiveLaunches.IsEmpty() || !EntitySubsystem)
 	{
 		return;
@@ -1627,7 +1738,7 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 		FActiveLaunch& Launch = It->Value;
 		FMassUnitTransformFragment* Transform = EntityManager.IsEntityValid(Handle)
 			? EntityManager.GetFragmentDataPtr<FMassUnitTransformFragment>(Handle) : nullptr;
-		const FMassUnitStateFragment* State = Transform ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle) : nullptr;
+		FMassUnitStateFragment* State = Transform ? EntityManager.GetFragmentDataPtr<FMassUnitStateFragment>(Handle) : nullptr;
 		if (!Transform || !State)
 		{
 			It.RemoveCurrent();
@@ -1639,6 +1750,7 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 		if (!Launch.bDead && State->CurrentState == EMassUnitState::Dead)
 		{
 			Launch.bDead = true;
+			State->bLeaping = false;
 			StartCorpseTumble(Launch, Handle);
 			PendingRagdollRequests.Emplace(FMassUnitEntityHandle(Handle), Launch.Velocity);
 			OnUnitLaunched.Broadcast(FMassUnitHandle(FMassUnitEntityHandle(Handle)), Launch.Velocity, true);
@@ -1705,6 +1817,15 @@ void UMassUnitEntityManager::TickLaunches(float DeltaTime)
 			Launch.SettleTime = 0.0f;
 			Launch.SettleFrom = UnitTransform.GetRotation();
 			Launch.Yaw = UnitTransform.Rotator().Yaw;
+			continue;
+		}
+
+		// A pounce lands on its feet: no knockdown, the unit is free to act at once.
+		if (Launch.bLeap)
+		{
+			It.RemoveCurrent();
+			State->bLeaping = false;
+			RemoveUnitStatus(Unit, UE::MassUnitSystem::Tags::StatusLaunched());
 			continue;
 		}
 

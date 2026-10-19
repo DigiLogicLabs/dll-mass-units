@@ -57,3 +57,12 @@ bottom. Mark unverified items **UNVERIFIED**. Promote anything that becomes a ru
 - 2026-10-17 — The project build is unity-batched, so a missing include can compile there and still break adopters:
   run the standalone `RunUAT BuildPlugin` (non-unity host project) after adding files. It caught `MassUnitStackSystem.cpp`
   using `FMassUnitVelocityFragment` without `MassUnitCommonFragments.h`.
+- 2026-10-18 — Flyers: the altitude band is relative to ground under the GROUP CENTRE (one trace when the group is
+  registered, reconfigured or moved), not under each unit; a group wandering over a hill higher than its floor clamp
+  can clip into it. While engaged the floor drops to the target's height - 50 so pits stay reachable. The launch landing
+  trace only reaches 1500 cm down; a death fall caps its landing at the band floor when that trace misses.
+- 2026-10-18 — `FMassUnitCrowdFragment::Reset()` (run whenever a unit joins a group) clears the interaction timer but
+  not `EMassUnitState::Interacting`; anything that ends a crowd state must not rely on a fragment timer alone. Engaged
+  flyers measure attack range in 3D, so their hover height is OUTSIDE range: "waiting for a token" for a flyer is the
+  column over the target, not the attack range (see the hover/dive change in the changelog). First flyer/leaper PIE
+  (Testing_MassStress, 10-18): leapers 12 pounces / 12 hits; flyers stayed in band.
